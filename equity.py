@@ -2,12 +2,14 @@
 equity.py
 =========
 Type: Core Module
-Purpose: Manages equity curve updates, method performance tracking, and 
-         rate-of-change (ROC) calculations per stock and method.
+Purpose: Manages equity curve updates, method performance tracking, 
+         in-flight active position state, and rate-of-change (ROC) 
+         calculations per stock and method.
 """
 
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
@@ -24,7 +26,8 @@ import simulation
 @dataclass
 class EquityRecord:
     """
-    Standardized data container representing the equity state resulting from a completed trade.
+    Standardized data container representing the equity state resulting from a completed
+    or currently active trade.
     """
     method_id: str
     symbol: str
@@ -33,18 +36,23 @@ class EquityRecord:
     sl_multiplier: float
     risk_reward: float
     entry_timestamp: str
-    exit_timestamp: str
+    exit_timestamp: Optional[str]  # None or empty string indicates an active/open trade
     entry_price: float
     exit_price: float
     trade_return: float  # Percentage return, e.g., 0.20 for +20%
     equity: float        # Accumulated method equity level
     roc: float          # Method equity-curve ROC 30
 
+    @property
+    def is_active(self) -> bool:
+        """Returns True if the trade is currently active/open (no valid exit timestamp)."""
+        return not self.exit_timestamp or str(self.exit_timestamp).strip().lower() in ("", "none", "nan", "nat")
+
 
 class EquityData:
     """
     State container for all method equity records associated with a specific stock.
-    Maintains chronological ordering by exit timestamp.
+    Maintains chronological ordering by entry/exit timestamp.
     """
     def __init__(self, symbol: str, records: Optional[List[EquityRecord]] = None):
         self.symbol = symbol
@@ -68,6 +76,12 @@ class EquityData:
         
         records = []
         for _, row in df.iterrows():
+            exit_ts = row.get("exit_timestamp")
+            if pd.isna(exit_ts) or str(exit_ts).strip().lower() in ("none", "nan", "nat", ""):
+                exit_ts_str = None
+            else:
+                exit_ts_str = str(exit_ts)
+
             records.append(EquityRecord(
                 method_id=str(row["method_id"]),
                 symbol=str(row["symbol"]),
@@ -76,17 +90,47 @@ class EquityData:
                 sl_multiplier=float(row["sl_multiplier"]),
                 risk_reward=float(row["risk_reward"]),
                 entry_timestamp=str(row["entry_timestamp"]),
-                exit_timestamp=str(row["exit_timestamp"]),
+                exit_timestamp=exit_ts_str,
                 entry_price=float(row["entry_price"]),
-                exit_price=float(row["exit_price"]),
-                trade_return=float(row["trade_return"]),
-                equity=float(row["equity"]),
-                roc=float(row["roc"])
+                exit_price=float(row.get("exit_price", 0.0)),
+                trade_return=float(row.get("trade_return", 0.0)),
+                equity=float(row.get("equity", getattr(config, "STARTING_EQUITY", 100.0))),
+                roc=float(row.get("roc", 0.0))
             ))
         return cls(symbol=symbol, records=records)
 
 # ==============================================================================
 # ========= End: 6.1 Equity Data Model =========================================
+# ==============================================================================
+
+
+# ==============================================================================
+# ========= Start: Helper Utilities ============================================
+# ==============================================================================
+
+def _parse_timestamp(ts: Union[str, datetime]) -> Optional[datetime]:
+    """Parses various timestamp inputs into UTC-aware datetime objects."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts.astimezone(timezone.utc) if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    
+    ts_str = str(ts).strip()
+    if not ts_str or ts_str.lower() in ("none", "nan", "nat"):
+        return None
+        
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        try:
+            dt = pd.to_datetime(ts_str).to_pydatetime()
+            return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+# ==============================================================================
+# ========= End: Helper Utilities ==============================================
 # ==============================================================================
 
 
@@ -122,31 +166,60 @@ def get_latest_method_states(equity_data: EquityData, methods: List[Method]) -> 
         if m_id in states:
             states[m_id]["equity"] = record.equity
             states[m_id]["roc"] = record.roc
-            states[m_id]["last_exit_timestamp"] = record.exit_timestamp
+            if record.exit_timestamp:
+                states[m_id]["last_exit_timestamp"] = record.exit_timestamp
             states[m_id]["equity_history"].append(record.equity)
 
     return states
 
 
-def get_latest_exit_timestamp(equity_data: EquityData, methods: Optional[List[Method]] = None) -> Optional[str]:
+def get_latest_exit_timestamp(
+    equity_data: EquityData, 
+    methods: Optional[List[Method]] = None
+) -> Optional[datetime]:
     """
-    Finds the earliest exit timestamp among all methods to safely determine 
-     historical simulation start bounds.
+    Finds the latest exit timestamp among completed trades across methods to safely determine 
+    historical simulation start bounds. Returns a datetime object or None.
     """
     if not equity_data or not equity_data.records:
         return None
 
-    if methods is None:
-        latest_timestamps = [r.exit_timestamp for r in equity_data.records if r.exit_timestamp]
-        return max(latest_timestamps) if latest_timestamps else None
+    valid_method_ids = {get_method_id(m) for m in methods} if methods is not None else None
 
-    valid_method_ids = {get_method_id(m) for m in methods}
-    timestamps = [
-        r.exit_timestamp for r in equity_data.records 
-        if r.method_id in valid_method_ids and r.exit_timestamp
-    ]
+    timestamps: List[datetime] = []
+    for r in equity_data.records:
+        if r.exit_timestamp and not r.is_active:
+            if valid_method_ids is None or r.method_id in valid_method_ids:
+                dt = _parse_timestamp(r.exit_timestamp)
+                if dt is not None:
+                    timestamps.append(dt)
     
-    return min(timestamps) if len(timestamps) == len(valid_method_ids) else None
+    return max(timestamps) if timestamps else None
+
+
+def get_earliest_active_trade_timestamp(
+    equity_data: EquityData, 
+    methods: Optional[List[Method]] = None
+) -> Optional[datetime]:
+    """
+    Scans equity records for currently open/in-flight positions (trades without an exit timestamp) 
+    and returns the earliest entry timestamp. This ensures simulations re-examine open positions 
+    rather than skipping over them.
+    """
+    if not equity_data or not equity_data.records:
+        return None
+
+    valid_method_ids = {get_method_id(m) for m in methods} if methods is not None else None
+
+    active_entry_timestamps: List[datetime] = []
+    for r in equity_data.records:
+        if r.is_active:
+            if valid_method_ids is None or r.method_id in valid_method_ids:
+                dt = _parse_timestamp(r.entry_timestamp)
+                if dt is not None:
+                    active_entry_timestamps.append(dt)
+
+    return min(active_entry_timestamps) if active_entry_timestamps else None
 
 # ==============================================================================
 # ========= End: 6.2 Equity Data Loading & Tracking ===========================
@@ -223,8 +296,8 @@ def update_equity_curves(
         if "trade_return" in trade:
             t_return = float(trade["trade_return"])
         else:
-            entry_p = float(trade["entry_price"])
-            exit_p = float(trade["exit_price"])
+            entry_p = float(trade.get("entry_price", 0.0))
+            exit_p = float(trade.get("exit_price", 0.0))
             t_return = (exit_p - entry_p) / entry_p if entry_p != 0 else 0.0
 
         new_eq = apply_trade_to_equity(prev_eq, t_return)
@@ -244,7 +317,7 @@ def update_equity_curves(
             sl_multiplier=float(trade.get("sl_multiplier", 0.0)),
             risk_reward=float(trade.get("risk_reward", 0.0)),
             entry_timestamp=str(trade.get("entry_timestamp", "")),
-            exit_timestamp=str(trade.get("exit_timestamp", "")),
+            exit_timestamp=str(trade.get("exit_timestamp", "")) if trade.get("exit_timestamp") else None,
             entry_price=float(trade.get("entry_price", 0.0)),
             exit_price=float(trade.get("exit_price", 0.0)),
             trade_return=t_return,
