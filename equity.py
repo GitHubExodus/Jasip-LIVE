@@ -19,16 +19,9 @@ from methods import Method, get_method_id
 import simulation
 
 
-# ==============================================================================
-# ========= Start: 6.1 Equity Data Model =======================================
-# ==============================================================================
-
 @dataclass
 class EquityRecord:
-    """
-    Standardized data container representing the equity state resulting from a completed
-    or currently active trade.
-    """
+    """Standardized data container representing a completed or active trade."""
     method_id: str
     symbol: str
     timeframe: str
@@ -36,30 +29,28 @@ class EquityRecord:
     sl_multiplier: float
     risk_reward: float
     entry_timestamp: str
-    exit_timestamp: Optional[str]  # None or empty string indicates an active/open trade
+    exit_timestamp: Optional[str]
     entry_price: float
     exit_price: float
-    trade_return: float  # Percentage return, e.g., 0.20 for +20%
-    equity: float        # Accumulated method equity level
-    roc: float          # Method equity-curve ROC 30
+    trade_return: float
+    equity: float
+    roc: float
 
     @property
     def is_active(self) -> bool:
-        """Returns True if the trade is currently active/open (no valid exit timestamp)."""
+        """Returns True if the trade is currently active/open."""
         return not self.exit_timestamp or str(self.exit_timestamp).strip().lower() in ("", "none", "nan", "nat")
 
 
 class EquityData:
-    """
-    State container for all method equity records associated with a specific stock.
-    Maintains chronological ordering by entry/exit timestamp.
-    """
+    """State container for all method equity records for a specific stock."""
+    
     def __init__(self, symbol: str, records: Optional[List[EquityRecord]] = None):
         self.symbol = symbol
         self.records: List[EquityRecord] = records if records is not None else []
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Converts the internal equity records into a Parquet-ready DataFrame."""
+        """Converts internal equity records into a Parquet-ready DataFrame."""
         if not self.records:
             return pd.DataFrame(columns=[
                 "method_id", "symbol", "timeframe", "strategy", "sl_multiplier",
@@ -84,7 +75,7 @@ class EquityData:
 
             records.append(EquityRecord(
                 method_id=str(row["method_id"]),
-                symbol=str(row["symbol"]),
+                symbol=str(row.get("symbol", symbol)),
                 timeframe=str(row["timeframe"]),
                 strategy=str(row["strategy"]),
                 sl_multiplier=float(row["sl_multiplier"]),
@@ -99,14 +90,6 @@ class EquityData:
             ))
         return cls(symbol=symbol, records=records)
 
-# ==============================================================================
-# ========= End: 6.1 Equity Data Model =========================================
-# ==============================================================================
-
-
-# ==============================================================================
-# ========= Start: Helper Utilities ============================================
-# ==============================================================================
 
 def _parse_timestamp(ts: Union[str, datetime]) -> Optional[datetime]:
     """Parses various timestamp inputs into UTC-aware datetime objects."""
@@ -129,25 +112,12 @@ def _parse_timestamp(ts: Union[str, datetime]) -> Optional[datetime]:
         except Exception:
             return None
 
-# ==============================================================================
-# ========= End: Helper Utilities ==============================================
-# ==============================================================================
-
-
-# ==============================================================================
-# ========= Start: 6.2 Equity Data Loading & Tracking =========================
-# ==============================================================================
 
 def get_latest_method_states(equity_data: EquityData, methods: List[Method]) -> Dict[str, Dict[str, Any]]:
-    """
-    Establishes the starting state for each method from existing stock equity data.
-    If a method has no prior history, it initializes with starting equity and zero ROC.
-    """
     starting_eq = getattr(config, "STARTING_EQUITY", 100.0)
     method_map = {get_method_id(m): m for m in methods}
     states: Dict[str, Dict[str, Any]] = {}
     
-    # Initialize defaults
     for m_id, method_obj in method_map.items():
         states[m_id] = {
             "method": method_obj,
@@ -160,7 +130,6 @@ def get_latest_method_states(equity_data: EquityData, methods: List[Method]) -> 
     if not equity_data or not equity_data.records:
         return states
 
-    # Parse through existing records chronologically
     for record in equity_data.records:
         m_id = record.method_id
         if m_id in states:
@@ -177,16 +146,12 @@ def get_latest_exit_timestamp(
     equity_data: EquityData, 
     methods: Optional[List[Method]] = None
 ) -> Optional[datetime]:
-    """
-    Finds the latest exit timestamp among completed trades across methods to safely determine 
-    historical simulation start bounds. Returns a datetime object or None.
-    """
     if not equity_data or not equity_data.records:
         return None
 
     valid_method_ids = {get_method_id(m) for m in methods} if methods is not None else None
-
     timestamps: List[datetime] = []
+
     for r in equity_data.records:
         if r.exit_timestamp and not r.is_active:
             if valid_method_ids is None or r.method_id in valid_method_ids:
@@ -201,17 +166,12 @@ def get_earliest_active_trade_timestamp(
     equity_data: EquityData, 
     methods: Optional[List[Method]] = None
 ) -> Optional[datetime]:
-    """
-    Scans equity records for currently open/in-flight positions (trades without an exit timestamp) 
-    and returns the earliest entry timestamp. This ensures simulations re-examine open positions 
-    rather than skipping over them.
-    """
     if not equity_data or not equity_data.records:
         return None
 
     valid_method_ids = {get_method_id(m) for m in methods} if methods is not None else None
-
     active_entry_timestamps: List[datetime] = []
+
     for r in equity_data.records:
         if r.is_active:
             if valid_method_ids is None or r.method_id in valid_method_ids:
@@ -221,60 +181,34 @@ def get_earliest_active_trade_timestamp(
 
     return min(active_entry_timestamps) if active_entry_timestamps else None
 
-# ==============================================================================
-# ========= End: 6.2 Equity Data Loading & Tracking ===========================
-# ==============================================================================
-
-
-# ==============================================================================
-# ========= Start: 6.3 Calculations ===========================================
-# ==============================================================================
 
 def apply_trade_to_equity(previous_equity: float, trade_return: float) -> float:
-    """Updates method equity based on relative trade return."""
     return previous_equity * (1.0 + trade_return)
 
 
 def calculate_equity_roc(equity_history: List[float], period: int = getattr(config, "ROC_PERIOD", 30)) -> float:
-    """Calculates Rate of Change (ROC) on the method's historical equity curve."""
     if len(equity_history) <= 1:
         return 0.0
     
     current_equity = equity_history[-1]
-    
-    if len(equity_history) > period:
-        past_equity = equity_history[-(period + 1)]
-    else:
-        past_equity = equity_history[0]
+    past_equity = equity_history[-(period + 1)] if len(equity_history) > period else equity_history[0]
         
     if past_equity <= 0:
         return 0.0
         
     return ((current_equity - past_equity) / past_equity) * 100.0
 
-# ==============================================================================
-# ========= End: 6.3 Calculations ==============================================
-# ==============================================================================
-
-
-# ==============================================================================
-# ========= Start: 6.4 Equity Integration Interfaces ==========================
-# ==============================================================================
 
 def update_equity_curves(
     existing_equity: EquityData,
     new_trades: List[Dict[str, Any]]
 ) -> EquityData:
-    """
-    Integrates newly completed simulation trades into existing equity curve structures.
-    """
     if not new_trades:
         return existing_equity
 
     symbol = existing_equity.symbol
     records = list(existing_equity.records)
     
-    # Map method histories
     history_map: Dict[str, List[float]] = {}
     latest_equity: Dict[str, float] = {}
     
@@ -327,34 +261,3 @@ def update_equity_curves(
         records.append(rec)
 
     return EquityData(symbol=symbol, records=records)
-
-
-def update_stock_equity(
-    symbol: str,
-    existing_equity_data: EquityData,
-    market_data: Dict[str, Any],
-    methods: List[Method]
-) -> Tuple[EquityData, Dict[str, float]]:
-    """
-    Primary API function for updating historical equity curves and retrieving ROC state maps.
-    """
-    method_states = get_latest_method_states(existing_equity_data, methods)
-    
-    cutoffs = {m_id: state["last_exit_timestamp"] for m_id, state in method_states.items()}
-    new_completed_trades = simulation.run_simulation(
-        market_data=market_data,
-        methods=methods,
-        cutoffs=cutoffs
-    )
-    
-    updated_equity_data = update_equity_curves(existing_equity_data, new_completed_trades)
-    
-    # Re-extract latest ROC values for downstream allocation modules
-    final_states = get_latest_method_states(updated_equity_data, methods)
-    latest_rocs = {m_id: state["roc"] for m_id, state in final_states.items()}
-
-    return updated_equity_data, latest_rocs
-
-# ==============================================================================
-# ========= End: 6.4 Equity Interface ==========================================
-# ==============================================================================
