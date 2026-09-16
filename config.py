@@ -32,7 +32,7 @@ R2_BUCKET_NAME = "stocks-data"
 
 R2_PATHS = {
     "raw_data": "{symbol}.parquet",
-    "equity": "equity_test/{symbol}.parquet",
+    "equity": "equity/{symbol}.parquet",
     "contributions": "contributions/contributions.parquet",
 }
 # ====== End: 3. Cloud Storage (R2) Settings =======
