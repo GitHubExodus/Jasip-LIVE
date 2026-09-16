@@ -1,0 +1,6 @@
+alpaca-py
+boto3
+pandas
+numpy
+numba
+pyarrow
