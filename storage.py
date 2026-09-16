@@ -187,13 +187,13 @@ def _df_to_equity_data(symbol: str, df: Optional[pd.DataFrame]) -> Any:
 # ==========================================
 
 def load_stock_equity(r2_manager: R2Manager, symbol: str) -> Optional[pd.DataFrame]:
-    prefix = getattr(config, "R2_EQUITY_PREFIX", "stocks-data/equity")
+    prefix = getattr(config, "R2_EQUITY_PREFIX", "stocks-data/equity_test")
     key = f"{prefix}/{symbol}.parquet"
     return read_parquet_from_r2(r2_manager, key)
 
 
 def save_stock_equity(r2_manager: R2Manager, symbol: str, df: pd.DataFrame) -> None:
-    prefix = getattr(config, "R2_EQUITY_PREFIX", "stocks-data/equity")
+    prefix = getattr(config, "R2_EQUITY_PREFIX", "stocks-data/equity_test")
     key = f"{prefix}/{symbol}.parquet"
     write_parquet_to_r2(r2_manager, df, key)
 
