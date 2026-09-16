@@ -17,23 +17,23 @@ MAX_TRADE_METHODS = 20
 
 
 # ========= Start: 2. Alpaca API Configuration =============
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "YOUR_ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+ALPACA_API_KEY = "PKA4A6THLEKI6QD2MQPOAO25J3"
+ALPACA_SECRET_KEY = "4nj9w53vMrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_DATA_URL = "https://data.alpaca.markets"
 # ====== End: 2. Alpaca API Configuration =======
 
 
 # ========= Start: 3. Cloud Storage (R2) Settings =============
-R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "https://<account_id>.r2.cloudflarestorage.com")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "YOUR_R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "YOUR_R2_SECRET_ACCESS_KEY")
-R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "trading-system-data")
+R2_ENDPOINT_URL = "https://98f8e959e677f16bddcf44f609fec6a0.r2.cloudflarestorage.com"
+R2_ACCESS_KEY_ID = "00e18b0c16ecb3395cd6f7c8e0eb3554"
+R2_SECRET_ACCESS_KEY = "33799355abaedc234309dbfbc80a2a66c3bfd856f0dcaecf0031e1fbcbcd84a0"
+R2_BUCKET_NAME = "stocks-data"
 
 R2_PATHS = {
-    "raw_data": "stocks-data/raw/{symbol}.parquet",
-    "equity": "stocks-data/equity/{symbol}.parquet",
-    "contributions": "stocks-data/contributions/contributions.parquet",
+    "raw_data": "{symbol}.parquet",
+    "equity": "equity_test/{symbol}.parquet",
+    "contributions": "contributions/contributions.parquet",
 }
 # ====== End: 3. Cloud Storage (R2) Settings =======
 
