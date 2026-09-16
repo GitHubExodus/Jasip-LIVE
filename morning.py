@@ -58,19 +58,28 @@ logger = logging.getLogger("MorningUpdater")
 LOOKBACK_BUFFER_DAYS = getattr(config, "LOOKBACK_BUFFER_DAYS", 90)
 
 
-def resolve_simulation_start_time(equity_data: EquityData, methods: List[Method]) -> Optional[datetime]:
+def resolve_simulation_start_time(equity_data: EquityData, methods: List[Method]) -> datetime:
     """
     Determines starting timestamp for data retrieval and backtesting.
-    Checks for in-flight/open trades first to prevent duplicates; falls back to
-    the latest completed trade exit timestamp.
+    Checks for in-flight/open trades first, falls back to the latest completed trade exit,
+    or defaults to LOOKBACK_BUFFER_DAYS ago for fresh starts.
     """
+    # 1. Active open trade check
     active_trade_time = get_earliest_active_trade_timestamp(equity_data, methods)
     if active_trade_time is not None:
         logger.info(f"Active in-flight position detected. Resuming simulation from: {active_trade_time}")
         return active_trade_time
 
-    return get_latest_exit_timestamp(equity_data, methods)
+    # 2. Historical trade exit check
+    latest_exit = get_latest_exit_timestamp(equity_data, methods)
+    if latest_exit is not None:
+        return latest_exit
 
+    # 3. Default Fallback for Fresh Start (e.g. 365 days lookback)
+    default_days = getattr(config, "INITIAL_BACKTEST_DAYS", 365)
+    fallback_time = datetime.now(timezone.utc) - timedelta(days=default_days)
+    logger.info(f"No existing equity history found. Initializing fresh start from {default_days} days ago ({fallback_time.strftime('%Y-%m-%d')}).")
+    return fallback_time
 
 def run_morning_update() -> None:
     """Main orchestration sequence for the pre-market equity update pipeline."""
