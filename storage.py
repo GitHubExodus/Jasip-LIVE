@@ -187,24 +187,24 @@ def _df_to_equity_data(symbol: str, df: Optional[pd.DataFrame]) -> Any:
 # ==========================================
 
 def load_stock_equity(r2_manager: R2Manager, symbol: str) -> Optional[pd.DataFrame]:
-    prefix = getattr(config, "R2_EQUITY_PREFIX", "stocks-data/equity")
+    prefix = getattr(config, "R2_EQUITY_PREFIX", "equity")
     key = f"{prefix}/{symbol}.parquet"
     return read_parquet_from_r2(r2_manager, key)
 
 
 def save_stock_equity(r2_manager: R2Manager, symbol: str, df: pd.DataFrame) -> None:
-    prefix = getattr(config, "R2_EQUITY_PREFIX", "stocks-data/equity")
+    prefix = getattr(config, "R2_EQUITY_PREFIX", "equity")
     key = f"{prefix}/{symbol}.parquet"
     write_parquet_to_r2(r2_manager, df, key)
 
 
 def load_global_contributions(r2_manager: R2Manager) -> Optional[pd.DataFrame]:
-    key = getattr(config, "R2_CONTRIBUTIONS_KEY", "stocks-data/contributions/contributions.parquet")
+    key = getattr(config, "R2_CONTRIBUTIONS_KEY", "contributions/contributions.parquet")
     return read_parquet_from_r2(r2_manager, key)
 
 
 def save_global_contributions(r2_manager: R2Manager, df: pd.DataFrame) -> None:
-    key = getattr(config, "R2_CONTRIBUTIONS_KEY", "stocks-data/contributions/contributions.parquet")
+    key = getattr(config, "R2_CONTRIBUTIONS_KEY", "contributions/contributions.parquet")
     write_parquet_to_r2(r2_manager, df, key)
 
 
