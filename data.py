@@ -101,6 +101,7 @@ def fetch_alpaca_bars(
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetches raw OHLCV market bars from Alpaca for a list of symbols.
+    Auto-initializes StockHistoricalDataClient if client is None.
     """
     if not validate_timeframe(timeframe):
         raise ValueError(f"Unsupported timeframe: {timeframe}")
@@ -112,34 +113,58 @@ def fetch_alpaca_bars(
     if end is not None and end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
 
-    # 1. Execute via SDK Client instance if provided
-    if alpaca_client is not None and ALPACA_AVAILABLE and isinstance(alpaca_client, StockHistoricalDataClient):
+    # Auto-instantiate Alpaca client if not explicitly passed
+    if alpaca_client is None and ALPACA_AVAILABLE:
+        api_key = getattr(config, "ALPACA_API_KEY", None)
+        secret_key = getattr(config, "ALPACA_SECRET_KEY", None)
+        if api_key and secret_key:
+            try:
+                alpaca_client = StockHistoricalDataClient(api_key, secret_key)
+            except Exception as e:
+                logger.error(f"Failed to instantiate StockHistoricalDataClient: {e}")
+
+    # Execute via SDK Client instance
+    if alpaca_client is not None and ALPACA_AVAILABLE:
         try:
             alpaca_tf = _get_alpaca_timeframe_unit(timeframe)
+            data_feed = getattr(config, "ALPACA_DATA_FEED", "iex")
+
             request_params = StockBarsRequest(
                 symbol_or_symbols=symbols,
                 timeframe=alpaca_tf,
                 start=start,
-                end=end
+                end=end,
+                feed=data_feed
             )
-            bars_response = alpaca_client.get_stock_bars(request_params)
             
-            # Group response into per-symbol DataFrames
+            logger.info(f"Querying Alpaca SDK for {symbols} ({timeframe}) from {start}...")
+            bars_response = alpaca_client.get_stock_bars(request_params)
+
             if hasattr(bars_response, "df"):
                 df_all = bars_response.df
                 if not df_all.empty:
+                    # Handle multi-index (symbol, timestamp) or single-index
                     for sym in symbols:
-                        if sym in df_all.index.levels[0]:
-                            raw_data[sym] = df_all.xs(sym).reset_index()
+                        try:
+                            if isinstance(df_all.index, pd.MultiIndex):
+                                if sym in df_all.index.get_level_values(0):
+                                    raw_data[sym] = df_all.xs(sym).reset_index()
+                            else:
+                                raw_data[sym] = df_all.reset_index()
+                        except Exception as parse_err:
+                            logger.warning(f"Failed parsing dataframe for {sym}: {parse_err}")
+            
             return raw_data
+
         except Exception as e:
             logger.error(f"Alpaca API error during bar fetching: {e}")
 
-    # 2. Defensive Fallback / Empty Schema Generation
+    # Fallback Schema Generation
     for symbol in symbols:
-        raw_data[symbol] = pd.DataFrame(columns=[
-            "timestamp", "open", "high", "low", "close", "volume"
-        ])
+        if raw_data[symbol].empty:
+            raw_data[symbol] = pd.DataFrame(columns=[
+                "timestamp", "open", "high", "low", "close", "volume"
+            ])
 
     return raw_data
 
@@ -199,8 +224,9 @@ def normalize_bar_data(df: pd.DataFrame) -> pd.DataFrame:
             normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
 
     # Drop duplicates & enforce chronological sorting
-    normalized = normalized.drop_duplicates(subset=["timestamp"])
-    normalized = normalized.sort_values(by="timestamp").reset_index(drop=True)
+    if "timestamp" in normalized.columns:
+        normalized = normalized.drop_duplicates(subset=["timestamp"])
+        normalized = normalized.sort_values(by="timestamp").reset_index(drop=True)
 
     # Enforce standard columns
     available_cols = [col for col in STANDARD_COLUMNS if col in normalized.columns]
@@ -219,7 +245,7 @@ def build_daily_from_30m(df_30m: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregates 30-minute bar data into standard 1-day OHLCV bars.
     """
-    if df_30m.empty:
+    if df_30m is None or df_30m.empty or "timestamp" not in df_30m.columns:
         return pd.DataFrame(columns=STANDARD_COLUMNS)
 
     df = df_30m.copy()
