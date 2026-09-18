@@ -1,7 +1,9 @@
+
+import os
 import time
 import math
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -15,24 +17,14 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    StopOrderRequest,
-    LimitOrderRequest,
-    TakeProfitRequest,
-    StopLossRequest,
-    GetOrdersRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    TimeInForce,
-    OrderClass,
-    QueryOrderStatus,
-)
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 
 # ============================================================
 # CONFIG
 # ============================================================
+
 
 API_KEY = "PKA4A6THLEKI6QD2MQPOAO25J3"
 API_SECRET = "4nj9w53vMrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
@@ -58,27 +50,25 @@ SYMBOLS = [
 
 TRADE_DOLLARS = 100.00
 
-# Historical expected-profit filter.
 EXPECTED_THRESHOLD = 0.01
 
 # ------------------------------------------------------------
-# FIXED EXIT SETTINGS
+# MANUAL EXIT SETTINGS
 # ------------------------------------------------------------
 
-FIXED_TP_PERCENT = 0.01
-
-FIXED_SL_PERCENT = 0.005
+FIXED_TP_PERCENT = 0.01       # +1.00%
+FIXED_SL_PERCENT = 0.005      # -0.50%
 
 # ------------------------------------------------------------
-
-ORDER_UPDATE_SECONDS = 30
-
-EXIT_CHECK_SECONDS = 2
+# ENTRY SETTINGS
+# ------------------------------------------------------------
 
 ENTRY_OFFSET = 0.01
 
+# Number of future bars used by historical breakout analysis.
 BREAKOUT_FUTURE_BARS = 3
 
+# Historical data start.
 HIST_START = datetime(
     2026,
     1,
@@ -86,9 +76,15 @@ HIST_START = datetime(
     tzinfo=timezone.utc,
 )
 
+# How often the application checks local positions/orders.
+ORDER_UPDATE_SECONDS = 1
+
+# How often the program prints status.
+STATUS_SECONDS = 5
+
 
 # ============================================================
-# CLIENTS
+# ALPACA CLIENTS
 # ============================================================
 
 historical_client = StockHistoricalDataClient(
@@ -104,375 +100,62 @@ trading_client = TradingClient(
 
 
 # ============================================================
-# LIVE STATE
+# STATE
 # ============================================================
-
-CURRENT_1M_BAR = {
-    symbol: None
-    for symbol in SYMBOLS
-}
-
-CURRENT_MINUTE = {
-    symbol: None
-    for symbol in SYMBOLS
-}
-
-TRADED_THIS_BAR = {
-    symbol: False
-    for symbol in SYMBOLS
-}
-
-BREAKOUT_STATS = {
-    symbol: {
-        "sum": 0.0,
-        "count": 0,
-    }
-    for symbol in SYMBOLS
-}
-
-ENTRY_ORDER_IDS = {
-    symbol: None
-    for symbol in SYMBOLS
-}
-
-LAST_ENTRY_PRICE = {
-    symbol: None
-    for symbol in SYMBOLS
-}
-
-OCO_ORDER_IDS = {
-    symbol: []
-    for symbol in SYMBOLS
-}
-
-PROCESSED_ENTRY_FILLS = set()
-
-PROCESSED_EXIT_FILLS = set()
-
-REAL_TRADE_COUNT = 0
 
 STATE_LOCK = threading.Lock()
 
+# Current 1-minute bar for each symbol.
+CURRENT_1M_BAR = {}
 
-# ============================================================
-# AUTHENTICATION
-# ============================================================
+# Previous completed 1-minute bar for each symbol.
+PREVIOUS_1M_BAR = {}
 
-def verify_alpaca_auth():
+# Current minute timestamp for each symbol.
+CURRENT_MINUTE = {}
 
-    print()
-    print("========================================")
-    print("CHECKING ALPACA AUTHENTICATION")
-    print("========================================")
+# Historical expected breakout profit.
+BREAKOUT_STATS = {}
 
-    try:
+# ------------------------------------------------------------
+# LOCAL TRADE STATE
+# ------------------------------------------------------------
 
-        account = trading_client.get_account()
+# symbol ->
+# {
+#     "status": "ENTRY_PENDING" / "OPEN" / "EXIT_PENDING",
+#     "entry_order_id": ...,
+#     "exit_order_id": ...,
+#     "qty": ...,
+#     "entry_price": ...,
+#     "take_profit": ...,
+#     "stop_loss": ...,
+# }
+LOCAL_TRADES = {}
 
-        print(
-            f"[AUTH OK] "
-            f"account={account.id}"
-        )
+# Prevents multiple entry orders during the same breakout.
+TRADED_THIS_BAR = {}
 
-        print(
-            f"[AUTH OK] "
-            f"paper={ALPACA_PAPER}"
-        )
+# Last live price received.
+LAST_PRICE = {}
 
-        print()
+# Last time status was printed.
+LAST_STATUS_PRINT = 0.0
 
-        return True
-
-    except Exception as e:
-
-        print()
-        print(
-            f"[AUTH ERROR] {e}"
-        )
-        print()
-        print(
-            "Trading engine will not start."
-        )
-        print(
-            "Check the Alpaca paper API credentials."
-        )
-        print()
-
-        return False
+# Prevent multiple websocket reconnect threads.
+STREAM_STARTED = False
 
 
 # ============================================================
-# HISTORICAL BREAKOUT STATISTICS
-# ============================================================
-
-def calculate_historical_breakout_stats(
-    symbol,
-    bars,
-):
-
-    if bars is None:
-        return
-
-    if len(bars) < BREAKOUT_FUTURE_BARS + 2:
-        return
-
-    highs = np.asarray(
-        bars["high"],
-        dtype=np.float64,
-    )
-
-    total = 0.0
-    count = 0
-
-    future_window = (
-        BREAKOUT_FUTURE_BARS + 1
-    )
-
-    max_index = (
-        len(highs)
-        - future_window
-    )
-
-    for i in range(
-        1,
-        max_index + 1,
-    ):
-
-        previous_high = highs[i - 1]
-
-        breakout_high = highs[i]
-
-        if previous_high <= 0:
-            continue
-
-        if breakout_high <= previous_high:
-            continue
-
-        future_max_high = np.max(
-            highs[
-                i:i + future_window
-            ]
-        )
-
-        profit = (
-            future_max_high
-            - previous_high
-        ) / previous_high
-
-        total += profit
-
-        count += 1
-
-    BREAKOUT_STATS[symbol] = {
-        "sum": total,
-        "count": count,
-    }
-
-
-def get_expected_profit(symbol):
-
-    stats = BREAKOUT_STATS[symbol]
-
-    if stats["count"] == 0:
-        return None
-
-    return (
-        stats["sum"]
-        / stats["count"]
-    )
-
-
-# ============================================================
-# HISTORICAL DATA
-# ============================================================
-
-def load_historical_stats(symbol):
-
-    end = (
-        datetime.now(timezone.utc)
-        - timedelta(minutes=10)
-    )
-
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Minute,
-        start=HIST_START,
-        end=end,
-        feed=DataFeed.IEX,
-    )
-
-    try:
-
-        response = (
-            historical_client
-            .get_stock_bars(request)
-        )
-
-        bars = response.df
-
-        if bars is None or len(bars) == 0:
-
-            print(
-                f"[HIST] {symbol}: "
-                f"no historical data"
-            )
-
-            return
-
-        calculate_historical_breakout_stats(
-            symbol,
-            bars,
-        )
-
-        expected = get_expected_profit(
-            symbol
-        )
-
-        if expected is None:
-
-            print(
-                f"[HIST] {symbol}: "
-                f"no breakout samples"
-            )
-
-        else:
-
-            print(
-                f"[HIST] {symbol}: "
-                f"breakouts="
-                f"{BREAKOUT_STATS[symbol]['count']} "
-                f"expected="
-                f"{expected:.2%}"
-            )
-
-    except Exception as e:
-
-        print(
-            f"[HIST ERROR] "
-            f"{symbol}: {e}"
-        )
-
-
-def load_all_historical_stats():
-
-    print()
-    print("========================================")
-    print("LOADING HISTORICAL DATA")
-    print("========================================")
-
-    for symbol in SYMBOLS:
-
-        load_historical_stats(
-            symbol
-        )
-
-    print()
-    print("Historical calculation complete.")
-    print()
-
-
-# ============================================================
-# LIVE 1-MINUTE BAR
-# ============================================================
-
-def get_minute_timestamp(timestamp):
-
-    return timestamp.replace(
-        second=0,
-        microsecond=0,
-    )
-
-
-def create_new_bar(
-    symbol,
-    timestamp,
-    price,
-    size,
-):
-
-    minute = get_minute_timestamp(
-        timestamp
-    )
-
-    CURRENT_1M_BAR[symbol] = {
-        "timestamp": minute,
-        "open": price,
-        "high": price,
-        "low": price,
-        "close": price,
-        "volume": size,
-    }
-
-    CURRENT_MINUTE[symbol] = minute
-
-    TRADED_THIS_BAR[symbol] = False
-
-    LAST_ENTRY_PRICE[symbol] = None
-
-    print(
-        f"[BAR] {symbol} "
-        f"{minute} "
-        f"new 1m bar"
-    )
-
-
-def update_live_1m_bar(data):
-
-    symbol = data.symbol
-
-    if symbol not in CURRENT_1M_BAR:
-        return
-
-    timestamp = data.timestamp
-
-    price = float(
-        data.price
-    )
-
-    size = float(
-        data.size
-    )
-
-    minute = get_minute_timestamp(
-        timestamp
-    )
-
-    current_bar = CURRENT_1M_BAR[symbol]
-
-    if (
-        current_bar is None
-        or CURRENT_MINUTE[symbol] != minute
-    ):
-
-        create_new_bar(
-            symbol,
-            timestamp,
-            price,
-            size,
-        )
-
-        return
-
-    current_bar["high"] = max(
-        current_bar["high"],
-        price,
-    )
-
-    current_bar["low"] = min(
-        current_bar["low"],
-        price,
-    )
-
-    current_bar["close"] = price
-
-    current_bar["volume"] += size
-
-
-# ============================================================
-# PRICE ROUNDING
+# PRICE HELPERS
 # ============================================================
 
 def round_price(price):
+    """
+    Alpaca stock price precision:
+    >= $1  -> 2 decimals
+    <  $1  -> 4 decimals
+    """
 
     price = float(price)
 
@@ -482,1219 +165,1220 @@ def round_price(price):
     return round(price, 4)
 
 
+def calculate_exit_prices(entry_price):
+    """
+    Calculate the local TP and SL.
+
+    These values are NOT submitted to Alpaca.
+    They exist only inside this program.
+    """
+
+    take_profit = entry_price * (1.0 + FIXED_TP_PERCENT)
+    stop_loss = entry_price * (1.0 - FIXED_SL_PERCENT)
+
+    return (
+        round_price(take_profit),
+        round_price(stop_loss),
+    )
+
+
 # ============================================================
-# GET NORMAL ORDER
+# HISTORICAL DATA
 # ============================================================
 
-def get_order(order_id):
+def load_historical_breakout_stats():
+    """
+    Build the historical expected breakout-profit statistic.
 
-    if order_id is None:
-        return None
+    For every bar:
+
+        previous high
+            ->
+        breakout above previous high
+            ->
+        inspect next BREAKOUT_FUTURE_BARS bars
+            ->
+        calculate maximum future high
+            ->
+        calculate expected profit
+
+    Result:
+
+        BREAKOUT_STATS[symbol] = average expected profit
+    """
+
+    print("\n" + "=" * 70)
+    print("LOADING HISTORICAL BREAKOUT STATS")
+    print("=" * 70)
 
     try:
-
-        return trading_client.get_order_by_id(
-            order_id
+        request = StockBarsRequest(
+            symbol_or_symbols=SYMBOLS,
+            timeframe=TimeFrame.Minute,
+            start=HIST_START,
+            feed=DataFeed.IEX,
         )
+
+        bars = historical_client.get_stock_bars(request)
 
     except Exception as e:
+        print(f"[HISTORICAL ERROR] {e}")
+        return
 
-        print(
-            f"[ORDER GET ERROR] "
-            f"{order_id}: {e}"
-        )
+    for symbol in SYMBOLS:
 
-        return None
+        try:
+            symbol_bars = bars[symbol]
 
-
-# ============================================================
-# GET NESTED ORDER
-# ============================================================
-
-def get_nested_order(
-    order_id,
-    symbol=None,
-):
-
-    if order_id is None:
-        return None
-
-    try:
-
-        request_kwargs = {
-            "status": QueryOrderStatus.ALL,
-            "limit": 500,
-            "nested": True,
-        }
-
-        if symbol is not None:
-
-            request_kwargs["symbols"] = [
-                symbol
-            ]
-
-        request = GetOrdersRequest(
-            **request_kwargs
-        )
-
-        orders = trading_client.get_orders(
-            filter=request
-        )
-
-        wanted_id = str(
-            order_id
-        )
-
-        for order in orders:
-
-            if str(order.id) == wanted_id:
-                return order
-
-            legs = getattr(
-                order,
-                "legs",
-                None,
-            )
-
-            if not legs:
+            if symbol_bars is None:
+                BREAKOUT_STATS[symbol] = 0.0
                 continue
 
-            for leg in legs:
+            highs = np.asarray(
+                [float(bar.high) for bar in symbol_bars],
+                dtype=np.float64,
+            )
 
-                if str(leg.id) == wanted_id:
-                    return order
+            if len(highs) < BREAKOUT_FUTURE_BARS + 2:
+                BREAKOUT_STATS[symbol] = 0.0
+                continue
 
-        return None
+            profits = []
 
-    except Exception as e:
+            for i in range(1, len(highs) - BREAKOUT_FUTURE_BARS):
 
-        print(
-            f"[NESTED ORDER GET ERROR] "
-            f"{order_id}: {e}"
-        )
+                previous_high = highs[i - 1]
+                breakout_high = highs[i]
 
-        return None
+                # Not a breakout.
+                if breakout_high <= previous_high:
+                    continue
+
+                future_end = i + BREAKOUT_FUTURE_BARS + 1
+
+                future_high = np.max(
+                    highs[i + 1:future_end]
+                )
+
+                if previous_high <= 0:
+                    continue
+
+                expected_profit = (
+                    future_high - previous_high
+                ) / previous_high
+
+                profits.append(expected_profit)
+
+            if profits:
+                BREAKOUT_STATS[symbol] = float(
+                    np.mean(profits)
+                )
+            else:
+                BREAKOUT_STATS[symbol] = 0.0
+
+            print(
+                f"{symbol:6s} "
+                f"expected breakout = "
+                f"{BREAKOUT_STATS[symbol] * 100:.3f}%"
+            )
+
+        except Exception as e:
+            print(
+                f"[HIST ERROR] {symbol}: {e}"
+            )
+
+            BREAKOUT_STATS[symbol] = 0.0
+
+    print("=" * 70)
 
 
 # ============================================================
-# GET LATEST SERVER-SIDE PRICE
+# AUTH
 # ============================================================
 
-def get_latest_server_price(
-    symbol,
-):
+def verify_alpaca_auth():
+    """
+    Verify that the trading account is reachable.
+    """
+
+    print("\nChecking Alpaca authentication...")
 
     try:
+        account = trading_client.get_account()
 
+        print(
+            f"[AUTH OK] "
+            f"account={account.account_number} "
+            f"status={account.status}"
+        )
+
+        return True
+
+    except Exception as e:
+        print(f"[AUTH ERROR] {e}")
+        return False
+
+
+# ============================================================
+# CURRENT SERVER PRICE
+# ============================================================
+
+def get_latest_server_price(symbol):
+    """
+    Get the latest trade directly from Alpaca.
+
+    This is used as a backup/reference price.
+    """
+
+    try:
         request = StockLatestTradeRequest(
             symbol_or_symbols=symbol,
             feed=DataFeed.IEX,
         )
 
-        trades = (
-            historical_client
-            .get_stock_latest_trade(
-                request_params=request
-            )
+        trades = historical_client.get_stock_latest_trade(
+            request
         )
 
-        trade = trades.get(
-            symbol
-        )
+        trade = trades.get(symbol)
 
         if trade is None:
             return None
 
-        price = float(
-            trade.price
-        )
-
-        if price <= 0:
-            return None
-
-        return price
+        return float(trade.price)
 
     except Exception as e:
-
         print(
-            f"[LATEST PRICE ERROR] "
-            f"{symbol}: {e}"
+            f"[PRICE ERROR] {symbol}: {e}"
         )
 
         return None
 
 
 # ============================================================
-# ENTRY ORDER CANCELLATION
+# BAR MANAGEMENT
 # ============================================================
 
-def cancel_existing_entry(
-    symbol,
-):
+def update_1m_bar(symbol, price, timestamp):
+    """
+    Add a live trade to the current 1-minute bar.
+    """
 
-    order_id = ENTRY_ORDER_IDS[symbol]
-
-    if order_id is None:
-        return False
-
-    order = get_order(
-        order_id
+    minute = timestamp.replace(
+        second=0,
+        microsecond=0,
     )
 
-    if order is None:
+    with STATE_LOCK:
 
-        ENTRY_ORDER_IDS[symbol] = None
-        LAST_ENTRY_PRICE[symbol] = None
+        LAST_PRICE[symbol] = float(price)
 
-        return False
+        # ----------------------------------------------------
+        # NEW MINUTE
+        # ----------------------------------------------------
 
-    status = str(
-        order.status
-    ).lower()
+        if (
+            symbol not in CURRENT_MINUTE
+            or CURRENT_MINUTE[symbol] != minute
+        ):
 
-    if status == "filled":
+            # Move current bar to previous bar.
+            if symbol in CURRENT_1M_BAR:
+                PREVIOUS_1M_BAR[symbol] = (
+                    CURRENT_1M_BAR[symbol].copy()
+                )
 
-        process_entry_fill(
+            CURRENT_MINUTE[symbol] = minute
+
+            CURRENT_1M_BAR[symbol] = {
+                "timestamp": minute,
+                "open": float(price),
+                "high": float(price),
+                "low": float(price),
+                "close": float(price),
+            }
+
+            # A new minute means a new entry opportunity.
+            TRADED_THIS_BAR[symbol] = False
+
+            return
+
+        # ----------------------------------------------------
+        # UPDATE CURRENT BAR
+        # ----------------------------------------------------
+
+        bar = CURRENT_1M_BAR[symbol]
+
+        if price > bar["high"]:
+            bar["high"] = float(price)
+
+        if price < bar["low"]:
+            bar["low"] = float(price)
+
+        bar["close"] = float(price)
+
+
+# ============================================================
+# ENTRY LOGIC
+# ============================================================
+
+def check_entry(symbol, price):
+    """
+    Determine whether this symbol should enter.
+
+    Entry logic:
+
+        previous 1-minute high
+                    +
+                ENTRY_OFFSET
+                    |
+                    v
+        current live price crosses it
+
+    Once triggered, a MARKET BUY is sent.
+
+    Alpaca does NOT hold a stop-entry order.
+    """
+
+    with STATE_LOCK:
+
+        if symbol not in PREVIOUS_1M_BAR:
+            return
+
+        if symbol not in CURRENT_1M_BAR:
+            return
+
+        # ----------------------------------------------------
+        # Already trading this symbol.
+        # ----------------------------------------------------
+
+        if symbol in LOCAL_TRADES:
+            return
+
+        # ----------------------------------------------------
+        # Already entered during this bar.
+        # ----------------------------------------------------
+
+        if TRADED_THIS_BAR.get(symbol, False):
+            return
+
+        previous_high = float(
+            PREVIOUS_1M_BAR[symbol]["high"]
+        )
+
+        entry_trigger = round_price(
+            previous_high + ENTRY_OFFSET
+        )
+
+        expected_profit = BREAKOUT_STATS.get(
             symbol,
-            order,
+            0.0,
         )
 
-        return True
+        if expected_profit < EXPECTED_THRESHOLD:
+            return
 
-    if status in {
-        "canceled",
-        "cancelled",
-        "rejected",
-        "expired",
-    }:
+        # ----------------------------------------------------
+        # No breakout yet.
+        # ----------------------------------------------------
 
-        ENTRY_ORDER_IDS[symbol] = None
-        LAST_ENTRY_PRICE[symbol] = None
-
-        return False
-
-    try:
-
-        trading_client.cancel_order_by_id(
-            order_id
-        )
+        if price < entry_trigger:
+            return
 
         print(
-            f"[ENTRY CANCEL] "
-            f"{symbol} "
-            f"{order_id}"
+            f"\n[ENTRY TRIGGER] {symbol} "
+            f"price={price:.4f} "
+            f"trigger={entry_trigger:.4f} "
+            f"expected={expected_profit * 100:.3f}%"
         )
 
-    except Exception as e:
-
-        print(
-            f"[CANCEL ERROR] "
-            f"{symbol}: {e}"
-        )
-
-    time.sleep(0.15)
-
-    order_after = get_order(
-        order_id
-    )
-
-    if order_after is None:
-
-        ENTRY_ORDER_IDS[symbol] = None
-        LAST_ENTRY_PRICE[symbol] = None
-
-        return False
-
-    final_status = str(
-        order_after.status
-    ).lower()
-
-    if final_status == "filled":
-
-        process_entry_fill(
-            symbol,
-            order_after,
-        )
-
-        return True
-
-    if final_status in {
-        "canceled",
-        "cancelled",
-        "rejected",
-        "expired",
-    }:
-
-        ENTRY_ORDER_IDS[symbol] = None
-        LAST_ENTRY_PRICE[symbol] = None
-
-        return False
-
-    return False
-
-
-# ============================================================
-# FIXED EXIT PRICE CALCULATION
-# ============================================================
-
-def calculate_exit_prices(
-    entry_price,
-):
-
-    # --------------------------------------------------------
-    # FIXED:
-    #
-    # TP = +1.00%
-    # SL = -0.50%
-    # --------------------------------------------------------
-
-    take_profit = (
-        entry_price
-        * (1.0 + FIXED_TP_PERCENT)
-    )
-
-    stop_loss = (
-        entry_price
-        * (1.0 - FIXED_SL_PERCENT)
-    )
-
-    take_profit = round_price(
-        take_profit
-    )
-
-    stop_loss = round_price(
-        stop_loss
-    )
-
-    if stop_loss <= 0:
-        return None, None
-
-    if stop_loss >= take_profit:
-        return None, None
-
-    return (
-        take_profit,
-        stop_loss,
-    )
-
-
-# ============================================================
-# SUBMIT OCO
-# ============================================================
-
-def submit_oco_after_fill(
-    symbol,
-    qty,
-    entry_price,
-):
-
-    take_profit, stop_loss = (
-        calculate_exit_prices(
-            entry_price
-        )
-    )
-
-    if take_profit is None:
-
-        print(
-            f"[OCO ERROR] {symbol}: "
-            f"invalid TP/SL"
-        )
-
-        return None
-
-    print(
-        f"[OCO SUBMIT] {symbol} "
-        f"entry={entry_price:.4f} "
-        f"TP={take_profit:.4f} "
-        f"SL={stop_loss:.4f} "
-        f"TP%={FIXED_TP_PERCENT:.2%} "
-        f"SL%={FIXED_SL_PERCENT:.2%} "
-        f"qty={qty}"
-    )
-
-    try:
-
-        request = LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC,
-            limit_price=take_profit,
-            order_class=OrderClass.OCO,
-            take_profit=TakeProfitRequest(
-                limit_price=take_profit
-            ),
-            stop_loss=StopLossRequest(
-                stop_price=stop_loss
-            ),
-        )
-
-        order = trading_client.submit_order(
-            order_data=request
-        )
-
-        order_id = str(
-            order.id
-        )
-
-        OCO_ORDER_IDS[symbol].append(
-            order_id
-        )
-
-        print(
-            f"[OCO ACCEPTED] "
-            f"{symbol} "
-            f"order={order_id}"
-        )
-
-        verify_oco(
-            symbol,
-            order_id,
-        )
-
-        return order_id
-
-    except Exception as e:
-
-        print(
-            f"[OCO ERROR] "
-            f"{symbol}: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# VERIFY OCO
-# ============================================================
-
-def verify_oco(
-    symbol,
-    order_id,
-):
-
-    order = get_nested_order(
-        order_id,
-        symbol=symbol,
-    )
-
-    if order is None:
-
-        print(
-            f"[OCO VERIFY ERROR] "
-            f"{symbol} "
-            f"order={order_id}"
-        )
-
-        return
-
-    print(
-        f"[OCO VERIFY] "
-        f"{symbol} "
-        f"parent_status="
-        f"{order.status}"
-    )
-
-    legs = getattr(
-        order,
-        "legs",
-        None,
-    )
-
-    if not legs:
-
-        print(
-            f"[OCO VERIFY] "
-            f"{symbol} "
-            f"no legs returned"
-        )
-
-        return
-
-    for leg in legs:
-
-        print(
-            f"[OCO LEG] "
-            f"{symbol} "
-            f"id={leg.id} "
-            f"side={leg.side} "
-            f"type={leg.type} "
-            f"status={leg.status} "
-            f"limit={getattr(leg, 'limit_price', None)} "
-            f"stop={getattr(leg, 'stop_price', None)}"
-        )
-
-
-# ============================================================
-# PROCESS ENTRY FILL
-# ============================================================
-
-def process_entry_fill(
-    symbol,
-    order,
-):
-
-    global REAL_TRADE_COUNT
-
-    order_id = str(
-        order.id
-    )
-
-    if order_id in PROCESSED_ENTRY_FILLS:
-
-        ENTRY_ORDER_IDS[symbol] = None
-
-        return
-
-    PROCESSED_ENTRY_FILLS.add(
-        order_id
-    )
-
-    if order.filled_avg_price is None:
-
-        print(
-            f"[ENTRY FILL ERROR] "
-            f"{symbol}: no filled price"
-        )
-
-        return
-
-    filled_price = float(
-        order.filled_avg_price
-    )
-
-    filled_qty = float(
-        order.filled_qty
-    )
-
-    REAL_TRADE_COUNT += 1
-
-    TRADED_THIS_BAR[symbol] = True
-
-    ENTRY_ORDER_IDS[symbol] = None
-
-    LAST_ENTRY_PRICE[symbol] = None
-
-    print(
-        f"[ENTRY FILLED] "
-        f"{symbol} "
-        f"qty={filled_qty} "
-        f"price={filled_price:.4f} "
-        f"trade_count={REAL_TRADE_COUNT}"
-    )
-
-    submit_oco_after_fill(
+        # Reserve the symbol immediately.
+        TRADED_THIS_BAR[symbol] = True
+
+        # Create the local pending state.
+        LOCAL_TRADES[symbol] = {
+            "status": "ENTRY_PENDING",
+            "entry_order_id": None,
+            "exit_order_id": None,
+            "qty": 0,
+            "entry_price": None,
+            "take_profit": None,
+            "stop_loss": None,
+        }
+
+    # Submit outside the lock.
+    submit_market_entry(
         symbol,
-        filled_qty,
-        filled_price,
+        price,
     )
 
 
-# ============================================================
-# CHECK ENTRY ORDER
-# ============================================================
+def submit_market_entry(symbol, reference_price):
+    """
+    Submit a normal MARKET BUY.
 
-def check_entry_order(
-    symbol,
-):
-
-    order_id = ENTRY_ORDER_IDS[symbol]
-
-    if order_id is None:
-        return False
-
-    order = get_order(
-        order_id
-    )
-
-    if order is None:
-        return False
-
-    status = str(
-        order.status
-    ).lower()
-
-    if status == "filled":
-
-        process_entry_fill(
-            symbol,
-            order,
-        )
-
-        return True
-
-    if status in {
-        "canceled",
-        "cancelled",
-        "rejected",
-        "expired",
-    }:
-
-        print(
-            f"[ENTRY DEAD] "
-            f"{symbol} "
-            f"status={status}"
-        )
-
-        ENTRY_ORDER_IDS[symbol] = None
-        LAST_ENTRY_PRICE[symbol] = None
-
-        return False
-
-    return False
-
-
-# ============================================================
-# CURRENT MARKET PRICE
-# ============================================================
-
-def get_current_market_price(
-    symbol,
-):
-
-    bar = CURRENT_1M_BAR[symbol]
-
-    if bar is None:
-        return None
-
-    return float(
-        bar["close"]
-    )
-
-
-# ============================================================
-# SUBMIT ENTRY
-# ============================================================
-
-def submit_entry_order(
-    symbol,
-    entry_price,
-):
-
-    entry_price = round_price(
-        entry_price
-    )
-
-    if entry_price <= 0:
-        return
-
-    # --------------------------------------------------------
-    # LOCAL PRICE CHECK
-    # --------------------------------------------------------
-
-    local_price = (
-        get_current_market_price(
-            symbol
-        )
-    )
-
-    if local_price is None:
-
-        print(
-            f"[ENTRY SKIP] "
-            f"{symbol}: "
-            f"no local market price"
-        )
-
-        return
-
-    if entry_price <= local_price:
-
-        print(
-            f"[ENTRY SKIP] "
-            f"{symbol} "
-            f"trigger={entry_price:.4f} "
-            f"local={local_price:.4f} "
-            f"trigger_not_above_market"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SERVER PRICE CHECK
-    # --------------------------------------------------------
-
-    server_price = (
-        get_latest_server_price(
-            symbol
-        )
-    )
-
-    if server_price is None:
-
-        print(
-            f"[ENTRY SKIP] "
-            f"{symbol}: "
-            f"could not get latest server price"
-        )
-
-        return
-
-    if entry_price <= server_price:
-
-        print(
-            f"[ENTRY SKIP] "
-            f"{symbol} "
-            f"trigger={entry_price:.4f} "
-            f"server={server_price:.4f} "
-            f"market_already_above_trigger"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # POSITION SIZE
-    # --------------------------------------------------------
+    No stop order.
+    No bracket.
+    No OCO.
+    """
 
     qty = math.floor(
-        TRADE_DOLLARS
-        / entry_price
+        TRADE_DOLLARS / reference_price
     )
 
-    if qty < 1:
-
+    if qty <= 0:
         print(
-            f"[ENTRY SKIP] "
-            f"{symbol}: "
-            f"price={entry_price:.4f}"
+            f"[ENTRY SKIP] {symbol}: "
+            f"price too high for ${TRADE_DOLLARS}"
         )
+
+        with STATE_LOCK:
+            LOCAL_TRADES.pop(symbol, None)
 
         return
 
-    # --------------------------------------------------------
-    # SUBMIT BUY STOP
-    # --------------------------------------------------------
-
     try:
 
-        request = StopOrderRequest(
+        order_request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            stop_price=entry_price,
+            time_in_force=TimeInForce.DAY,
         )
 
         order = trading_client.submit_order(
-            order_data=request
+            order_data=order_request
         )
 
-        ENTRY_ORDER_IDS[symbol] = (
-            str(order.id)
-        )
+        with STATE_LOCK:
+            if symbol in LOCAL_TRADES:
+                LOCAL_TRADES[symbol][
+                    "entry_order_id"
+                ] = str(order.id)
 
-        LAST_ENTRY_PRICE[symbol] = (
-            entry_price
-        )
+                LOCAL_TRADES[symbol][
+                    "qty"
+                ] = qty
 
         print(
-            f"[ENTRY] "
-            f"{symbol} "
-            f"BUY STOP "
-            f"qty={qty} "
-            f"trigger={entry_price:.4f} "
-            f"local={local_price:.4f} "
-            f"server={server_price:.4f} "
+            f"[ENTRY ORDER] {symbol} "
+            f"BUY {qty} shares "
             f"order={order.id}"
         )
 
     except Exception as e:
 
-        ENTRY_ORDER_IDS[symbol] = None
-        LAST_ENTRY_PRICE[symbol] = None
-
-        error_text = str(e)
-
         print(
-            f"[ENTRY ERROR] "
-            f"{symbol}: {error_text}"
+            f"[ENTRY ERROR] {symbol}: {e}"
         )
 
-        if (
-            "stop price must be greater"
-            in error_text.lower()
-        ):
-
-            print(
-                f"[ENTRY RACE] "
-                f"{symbol}: "
-                f"market moved through trigger "
-                f"before Alpaca accepted the order."
-            )
+        with STATE_LOCK:
+            LOCAL_TRADES.pop(symbol, None)
+            TRADED_THIS_BAR[symbol] = False
 
 
 # ============================================================
-# UPDATE ONE ENTRY
+# ENTRY ORDER MONITOR
 # ============================================================
 
-def update_entry_order(
-    symbol,
-):
+def process_entry_orders():
+    """
+    Check pending market BUY orders until Alpaca reports
+    their actual fill.
 
-    bar = CURRENT_1M_BAR[symbol]
+    The actual fill price becomes our entry price.
+    """
 
-    if bar is None:
-        return
+    symbols_to_check = []
 
-    # --------------------------------------------------------
-    # ALREADY TRADED THIS BAR
-    # --------------------------------------------------------
+    with STATE_LOCK:
 
-    if TRADED_THIS_BAR[symbol]:
-
-        if ENTRY_ORDER_IDS[symbol] is not None:
-
-            check_entry_order(
-                symbol
-            )
+        for symbol, trade in LOCAL_TRADES.items():
 
             if (
-                ENTRY_ORDER_IDS[symbol]
-                is not None
+                trade["status"] == "ENTRY_PENDING"
+                and trade["entry_order_id"] is not None
             ):
-
-                cancel_existing_entry(
-                    symbol
+                symbols_to_check.append(
+                    (
+                        symbol,
+                        trade["entry_order_id"],
+                    )
                 )
 
-        return
+    for symbol, order_id in symbols_to_check:
 
-    # --------------------------------------------------------
-    # EXPECTED-PROFIT ENTRY FILTER
-    # --------------------------------------------------------
+        try:
 
-    expected_profit = (
-        get_expected_profit(
-            symbol
-        )
-    )
-
-    if (
-        expected_profit is None
-        or expected_profit <= EXPECTED_THRESHOLD
-    ):
-
-        if ENTRY_ORDER_IDS[symbol] is not None:
-
-            cancel_existing_entry(
-                symbol
+            order = trading_client.get_order_by_id(
+                order_id
             )
 
-        return
+            status = str(order.status).lower()
 
-    # --------------------------------------------------------
-    # CHECK EXISTING ORDER
-    # --------------------------------------------------------
+            # ------------------------------------------------
+            # FILLED
+            # ------------------------------------------------
 
-    if ENTRY_ORDER_IDS[symbol] is not None:
+            if status == "filled":
 
-        filled = check_entry_order(
-            symbol
-        )
+                fill_price = float(
+                    order.filled_avg_price
+                )
 
-        if filled:
-            return
+                filled_qty = int(
+                    float(order.filled_qty)
+                )
 
-    # --------------------------------------------------------
-    # CALCULATE ENTRY TRIGGER
-    # --------------------------------------------------------
-
-    current_high = float(
-        bar["high"]
-    )
-
-    entry_price = round_price(
-        current_high
-        + ENTRY_OFFSET
-    )
-
-    # --------------------------------------------------------
-    # LOCAL MARKET PRICE
-    # --------------------------------------------------------
-
-    current_price = (
-        get_current_market_price(
-            symbol
-        )
-    )
-
-    if current_price is None:
-        return
-
-    # --------------------------------------------------------
-    # TRIGGER MUST BE ABOVE MARKET
-    # --------------------------------------------------------
-
-    if entry_price <= current_price:
-
-        if ENTRY_ORDER_IDS[symbol] is not None:
-
-            cancel_existing_entry(
-                symbol
-            )
-
-        print(
-            f"[ENTRY WAIT] "
-            f"{symbol} "
-            f"trigger={entry_price:.4f} "
-            f"market={current_price:.4f}"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # EXISTING ORDER HAS SAME TRIGGER
-    # --------------------------------------------------------
-
-    if (
-        ENTRY_ORDER_IDS[symbol]
-        is not None
-        and LAST_ENTRY_PRICE[symbol]
-        == entry_price
-    ):
-
-        return
-
-    # --------------------------------------------------------
-    # CANCEL OLD ORDER
-    # --------------------------------------------------------
-
-    if ENTRY_ORDER_IDS[symbol] is not None:
-
-        filled_during_cancel = (
-            cancel_existing_entry(
-                symbol
-            )
-        )
-
-        if filled_during_cancel:
-            return
-
-    # --------------------------------------------------------
-    # CHECK TRADE STATE AGAIN
-    # --------------------------------------------------------
-
-    if TRADED_THIS_BAR[symbol]:
-        return
-
-    # --------------------------------------------------------
-    # FINAL LOCAL CHECK
-    # --------------------------------------------------------
-
-    current_price = (
-        get_current_market_price(
-            symbol
-        )
-    )
-
-    if current_price is None:
-        return
-
-    if entry_price <= current_price:
-
-        print(
-            f"[ENTRY SKIP] "
-            f"{symbol} "
-            f"trigger={entry_price:.4f} "
-            f"market={current_price:.4f}"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SUBMIT
-    # --------------------------------------------------------
-
-    submit_entry_order(
-        symbol,
-        entry_price,
-    )
-
-
-# ============================================================
-# UPDATE ALL ENTRIES
-# ============================================================
-
-def update_all_entry_orders():
-
-    while True:
-
-        start = time.time()
-
-        for symbol in SYMBOLS:
-
-            try:
+                take_profit, stop_loss = (
+                    calculate_exit_prices(
+                        fill_price
+                    )
+                )
 
                 with STATE_LOCK:
 
-                    update_entry_order(
-                        symbol
-                    )
+                    if symbol not in LOCAL_TRADES:
+                        continue
 
-            except Exception as e:
+                    LOCAL_TRADES[symbol].update({
+                        "status": "OPEN",
+                        "qty": filled_qty,
+                        "entry_price": fill_price,
+                        "take_profit": take_profit,
+                        "stop_loss": stop_loss,
+                    })
 
                 print(
-                    f"[UPDATE ERROR] "
-                    f"{symbol}: {e}"
+                    f"\n[ENTRY FILLED] {symbol}"
                 )
 
-        elapsed = (
-            time.time()
-            - start
-        )
+                print(
+                    f"  qty         = {filled_qty}"
+                )
 
-        time.sleep(
-            max(
-                0.1,
-                ORDER_UPDATE_SECONDS
-                - elapsed,
-            )
-        )
+                print(
+                    f"  entry       = {fill_price:.4f}"
+                )
 
+                print(
+                    f"  TAKE PROFIT = {take_profit:.4f} "
+                    f"(+{FIXED_TP_PERCENT * 100:.2f}%)"
+                )
 
-# ============================================================
-# EXIT MONITOR
-# ============================================================
+                print(
+                    f"  STOP LOSS   = {stop_loss:.4f} "
+                    f"(-{FIXED_SL_PERCENT * 100:.2f}%)"
+                )
 
-def monitor_oco(
-    symbol,
-    oco_id,
-):
+            # ------------------------------------------------
+            # FAILED
+            # ------------------------------------------------
 
-    order = get_nested_order(
-        oco_id,
-        symbol=symbol,
-    )
+            elif status in {
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
+            }:
 
-    if order is None:
-        return
+                print(
+                    f"[ENTRY FAILED] {symbol} "
+                    f"status={status}"
+                )
 
-    legs = getattr(
-        order,
-        "legs",
-        None,
-    )
+                with STATE_LOCK:
+                    LOCAL_TRADES.pop(symbol, None)
 
-    if not legs:
-        return
-
-    for leg in legs:
-
-        leg_id = str(
-            leg.id
-        )
-
-        status = str(
-            leg.status
-        ).lower()
-
-        # ----------------------------------------------------
-        # EXIT FILLED
-        # ----------------------------------------------------
-
-        if status == "filled":
-
-            if leg_id in PROCESSED_EXIT_FILLS:
-                continue
-
-            PROCESSED_EXIT_FILLS.add(
-                leg_id
-            )
-
-            filled_price = getattr(
-                leg,
-                "filled_avg_price",
-                None,
-            )
-
-            limit_price = getattr(
-                leg,
-                "limit_price",
-                None,
-            )
-
-            stop_price = getattr(
-                leg,
-                "stop_price",
-                None,
-            )
-
-            leg_type = str(
-                leg.type
-            ).lower()
-
-            if (
-                limit_price is not None
-                and leg_type == "limit"
-            ):
-
-                exit_type = "TAKE_PROFIT"
-
-            elif stop_price is not None:
-
-                exit_type = "STOP_LOSS"
+            # ------------------------------------------------
+            # STILL WORKING
+            # ------------------------------------------------
 
             else:
 
-                exit_type = "EXIT"
+                pass
 
-            print()
+        except Exception as e:
+
             print(
-                "========================================"
+                f"[ENTRY CHECK ERROR] "
+                f"{symbol}: {e}"
             )
-            print(
-                f"[EXIT FILLED] {symbol}"
-            )
-            print(
-                f"type={exit_type}"
-            )
-            print(
-                f"order={leg_id}"
-            )
-            print(
-                f"filled_price={filled_price}"
-            )
-            print(
-                f"limit_price={limit_price}"
-            )
-            print(
-                f"stop_price={stop_price}"
-            )
-            print(
-                "========================================"
-            )
-            print()
+
+
+# ============================================================
+# MANUAL EXIT LOGIC
+# ============================================================
+
+def check_exit(symbol, price):
+    """
+    Manually manage TP/SL.
+
+    This is the critical part.
+
+    The program itself determines:
+
+        price >= TP
+            -> SELL
+
+        price <= SL
+            -> SELL
+
+    No stop-loss or take-profit order exists at Alpaca.
+    """
+
+    with STATE_LOCK:
+
+        trade = LOCAL_TRADES.get(symbol)
+
+        if trade is None:
+            return
+
+        if trade["status"] != "OPEN":
+            return
+
+        entry_price = trade["entry_price"]
+        take_profit = trade["take_profit"]
+        stop_loss = trade["stop_loss"]
+        qty = trade["qty"]
+
+        if (
+            entry_price is None
+            or take_profit is None
+            or stop_loss is None
+            or qty <= 0
+        ):
+            return
 
         # ----------------------------------------------------
-        # PRINT REJECTION
+        # TAKE PROFIT
         # ----------------------------------------------------
 
-        elif status in {
-            "rejected",
-            "expired",
-        }:
+        if price >= take_profit:
 
             print(
-                f"[EXIT ERROR] "
-                f"{symbol} "
-                f"leg={leg_id} "
-                f"status={status}"
+                f"\n[TP TRIGGER] {symbol} "
+                f"price={price:.4f} "
+                f"TP={take_profit:.4f}"
             )
 
+            trade["status"] = "EXIT_PENDING"
 
-def monitor_all_oco_orders():
+            exit_reason = "TP"
 
-    while True:
+        # ----------------------------------------------------
+        # STOP LOSS
+        # ----------------------------------------------------
 
-        for symbol in SYMBOLS:
+        elif price <= stop_loss:
 
-            try:
+            print(
+                f"\n[SL TRIGGER] {symbol} "
+                f"price={price:.4f} "
+                f"SL={stop_loss:.4f}"
+            )
+
+            trade["status"] = "EXIT_PENDING"
+
+            exit_reason = "SL"
+
+        else:
+            return
+
+    # Submit outside lock.
+    submit_market_exit(
+        symbol,
+        qty,
+        exit_reason,
+    )
+
+
+def submit_market_exit(symbol, qty, reason):
+    """
+    Submit a normal MARKET SELL.
+
+    Alpaca is only executing the sell.
+    Python decided that the position should be closed.
+    """
+
+    try:
+
+        order_request = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        )
+
+        order = trading_client.submit_order(
+            order_data=order_request
+        )
+
+        with STATE_LOCK:
+
+            if symbol in LOCAL_TRADES:
+                LOCAL_TRADES[symbol][
+                    "exit_order_id"
+                ] = str(order.id)
+
+        print(
+            f"[EXIT ORDER] {symbol} "
+            f"SELL {qty} "
+            f"reason={reason} "
+            f"order={order.id}"
+        )
+
+    except Exception as e:
+
+        print(
+            f"[EXIT ERROR] {symbol}: {e}"
+        )
+
+        # We do NOT delete the position.
+        #
+        # The position is still open.
+        # Keep it locally OPEN so the program
+        # can try again.
+
+        with STATE_LOCK:
+
+            if symbol in LOCAL_TRADES:
+                LOCAL_TRADES[symbol][
+                    "status"
+                ] = "OPEN"
+
+
+# ============================================================
+# EXIT ORDER MONITOR
+# ============================================================
+
+def process_exit_orders():
+    """
+    Wait for the market SELL to actually fill.
+    """
+
+    symbols_to_check = []
+
+    with STATE_LOCK:
+
+        for symbol, trade in LOCAL_TRADES.items():
+
+            if (
+                trade["status"] == "EXIT_PENDING"
+                and trade["exit_order_id"] is not None
+            ):
+                symbols_to_check.append(
+                    (
+                        symbol,
+                        trade["exit_order_id"],
+                    )
+                )
+
+    for symbol, order_id in symbols_to_check:
+
+        try:
+
+            order = trading_client.get_order_by_id(
+                order_id
+            )
+
+            status = str(order.status).lower()
+
+            # ------------------------------------------------
+            # FILLED
+            # ------------------------------------------------
+
+            if status == "filled":
+
+                exit_price = float(
+                    order.filled_avg_price
+                )
 
                 with STATE_LOCK:
 
-                    order_ids = list(
-                        OCO_ORDER_IDS[symbol]
+                    trade = LOCAL_TRADES.get(
+                        symbol
                     )
 
-                for oco_id in order_ids:
+                    if trade is None:
+                        continue
 
-                    monitor_oco(
-                        symbol,
-                        oco_id,
+                    entry_price = float(
+                        trade["entry_price"]
                     )
 
-            except Exception as e:
+                    qty = float(
+                        trade["qty"]
+                    )
+
+                    pnl_percent = (
+                        (exit_price - entry_price)
+                        / entry_price
+                    )
+
+                    pnl_dollars = (
+                        exit_price - entry_price
+                    ) * qty
+
+                    print(
+                        f"\n[EXIT FILLED] {symbol}"
+                    )
+
+                    print(
+                        f"  qty       = {qty:g}"
+                    )
+
+                    print(
+                        f"  entry     = {entry_price:.4f}"
+                    )
+
+                    print(
+                        f"  exit      = {exit_price:.4f}"
+                    )
+
+                    print(
+                        f"  return    = "
+                        f"{pnl_percent * 100:.3f}%"
+                    )
+
+                    print(
+                        f"  P/L       = "
+                        f"${pnl_dollars:.2f}"
+                    )
+
+                    # Completely remove local position.
+                    LOCAL_TRADES.pop(symbol, None)
+
+            # ------------------------------------------------
+            # FAILED
+            # ------------------------------------------------
+
+            elif status in {
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
+            }:
 
                 print(
-                    f"[EXIT MONITOR ERROR] "
-                    f"{symbol}: {e}"
+                    f"[EXIT FAILED] {symbol} "
+                    f"status={status}"
                 )
 
-        time.sleep(
-            EXIT_CHECK_SECONDS
+                # Position still exists.
+                # Return it to OPEN so the local
+                # TP/SL monitor continues working.
+
+                with STATE_LOCK:
+
+                    if symbol in LOCAL_TRADES:
+
+                        LOCAL_TRADES[symbol][
+                            "status"
+                        ] = "OPEN"
+
+                        LOCAL_TRADES[symbol][
+                            "exit_order_id"
+                        ] = None
+
+        except Exception as e:
+
+            print(
+                f"[EXIT CHECK ERROR] "
+                f"{symbol}: {e}"
+            )
+
+
+# ============================================================
+# RECONCILE EXISTING ALPACA POSITIONS
+# ============================================================
+
+def reconcile_existing_positions():
+    """
+    Important safety feature.
+
+    If the program restarts while a position is already open,
+    discover that position from Alpaca and begin managing it
+    locally.
+
+    This means an existing position is not ignored.
+    """
+
+    print("\nChecking existing Alpaca positions...")
+
+    try:
+
+        positions = trading_client.get_all_positions()
+
+    except Exception as e:
+
+        print(
+            f"[POSITION ERROR] {e}"
         )
+
+        return
+
+    for position in positions:
+
+        symbol = str(
+            position.symbol
+        )
+
+        if symbol not in SYMBOLS:
+            continue
+
+        try:
+
+            qty = int(
+                float(position.qty)
+            )
+
+            entry_price = float(
+                position.avg_entry_price
+            )
+
+            if qty <= 0:
+                continue
+
+            take_profit, stop_loss = (
+                calculate_exit_prices(
+                    entry_price
+                )
+            )
+
+            with STATE_LOCK:
+
+                LOCAL_TRADES[symbol] = {
+                    "status": "OPEN",
+                    "entry_order_id": None,
+                    "exit_order_id": None,
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "take_profit": take_profit,
+                    "stop_loss": stop_loss,
+                }
+
+            print(
+                f"[POSITION RECOVERED] {symbol} "
+                f"qty={qty} "
+                f"entry={entry_price:.4f} "
+                f"TP={take_profit:.4f} "
+                f"SL={stop_loss:.4f}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"[POSITION RECOVERY ERROR] "
+                f"{symbol}: {e}"
+            )
 
 
 # ============================================================
 # WEBSOCKET
 # ============================================================
 
-async def on_trade(data):
+def websocket_worker():
+    """
+    Alpaca websocket receives live trades.
 
-    symbol = data.symbol
+    Every trade:
 
-    if symbol not in CURRENT_1M_BAR:
+        1. updates local price
+        2. updates 1-minute bar
+        3. checks entry
+        4. checks TP/SL
+    """
+
+    global STREAM_STARTED
+
+    if STREAM_STARTED:
         return
 
-    with STATE_LOCK:
+    STREAM_STARTED = True
 
-        update_live_1m_bar(
-            data
-        )
+    while True:
 
+        try:
 
-def websocket_worker():
+            print(
+                "\nStarting Alpaca market-data stream..."
+            )
 
-    try:
+            stream = StockDataStream(
+                API_KEY,
+                API_SECRET,
+                feed=DataFeed.IEX,
+            )
 
-        stream = StockDataStream(
-            API_KEY,
-            API_SECRET,
-            feed=DataFeed.IEX,
-        )
+            async def handle_trade(trade):
 
-        for symbol in SYMBOLS:
+                try:
+
+                    symbol = str(
+                        trade.symbol
+                    )
+
+                    price = float(
+                        trade.price
+                    )
+
+                    timestamp = trade.timestamp
+
+                    if timestamp is None:
+                        timestamp = datetime.now(
+                            timezone.utc
+                        )
+
+                    # ----------------------------------------
+                    # Update local market data.
+                    # ----------------------------------------
+
+                    update_1m_bar(
+                        symbol,
+                        price,
+                        timestamp,
+                    )
+
+                    # ----------------------------------------
+                    # ENTRY
+                    # ----------------------------------------
+
+                    check_entry(
+                        symbol,
+                        price,
+                    )
+
+                    # ----------------------------------------
+                    # EXIT
+                    # ----------------------------------------
+
+                    check_exit(
+                        symbol,
+                        price,
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"[TRADE HANDLER ERROR] "
+                        f"{e}"
+                    )
 
             stream.subscribe_trades(
-                on_trade,
-                symbol,
-            )
-
-        print(
-            "[WS] Starting live stream..."
-        )
-
-        stream.run()
-
-    except Exception as e:
-
-        error_text = str(e)
-
-        print(
-            f"[WS ERROR] {error_text}"
-        )
-
-        if (
-            "auth failed"
-            in error_text.lower()
-            or "authentication"
-            in error_text.lower()
-            or "unauthorized"
-            in error_text.lower()
-        ):
-
-            print(
-                "[WS] Authentication failed."
+                handle_trade,
+                *SYMBOLS,
             )
 
             print(
-                "[WS] WebSocket stopped."
+                "Websocket connected."
             )
 
-            return
+            stream.run()
 
-        print(
-            "[WS] Non-authentication failure."
+        except Exception as e:
+
+            print(
+                f"[WEBSOCKET ERROR] {e}"
+            )
+
+            print(
+                "Retrying websocket in 5 seconds..."
+            )
+
+            time.sleep(5)
+
+
+# ============================================================
+# ORDER MONITOR
+# ============================================================
+
+def order_monitor_worker():
+    """
+    Continuously monitors:
+
+        entry market orders
+        exit market orders
+    """
+
+    while True:
+
+        try:
+
+            process_entry_orders()
+            process_exit_orders()
+
+        except Exception as e:
+
+            print(
+                f"[ORDER MONITOR ERROR] {e}"
+            )
+
+        time.sleep(
+            ORDER_UPDATE_SECONDS
         )
 
-        print(
-            "[WS] Reconnecting in 5 seconds..."
-        )
 
-        time.sleep(5)
+# ============================================================
+# POSITION SAFETY MONITOR
+# ============================================================
 
-        websocket_worker()
+def position_safety_worker():
+    """
+    Backup monitor.
+
+    If websocket data misses something, this periodically
+    checks Alpaca's latest trade for every locally-open position.
+
+    This is NOT used as the primary price source.
+    The websocket remains primary.
+    """
+
+    while True:
+
+        try:
+
+            with STATE_LOCK:
+
+                open_symbols = [
+                    symbol
+                    for symbol, trade
+                    in LOCAL_TRADES.items()
+                    if trade["status"] == "OPEN"
+                ]
+
+            for symbol in open_symbols:
+
+                price = get_latest_server_price(
+                    symbol
+                )
+
+                if price is None:
+                    continue
+
+                with STATE_LOCK:
+                    LAST_PRICE[symbol] = price
+
+                check_exit(
+                    symbol,
+                    price,
+                )
+
+                time.sleep(0.05)
+
+        except Exception as e:
+
+            print(
+                f"[SAFETY MONITOR ERROR] {e}"
+            )
+
+        time.sleep(1)
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+def status_worker():
+    """
+    Print current local trading state.
+    """
+
+    global LAST_STATUS_PRINT
+
+    while True:
+
+        try:
+
+            now = time.time()
+
+            if (
+                now - LAST_STATUS_PRINT
+                < STATUS_SECONDS
+            ):
+                time.sleep(1)
+                continue
+
+            LAST_STATUS_PRINT = now
+
+            with STATE_LOCK:
+
+                trades = {
+                    symbol: data.copy()
+                    for symbol, data
+                    in LOCAL_TRADES.items()
+                }
+
+                prices = LAST_PRICE.copy()
+
+            if trades:
+
+                print(
+                    "\n" + "-" * 70
+                )
+
+                print(
+                    "LOCAL POSITIONS"
+                )
+
+                for symbol, trade in trades.items():
+
+                    price = prices.get(
+                        symbol,
+                        0.0,
+                    )
+
+                    entry = trade.get(
+                        "entry_price"
+                    )
+
+                    tp = trade.get(
+                        "take_profit"
+                    )
+
+                    sl = trade.get(
+                        "stop_loss"
+                    )
+
+                    if (
+                        entry is not None
+                        and price > 0
+                    ):
+
+                        pnl = (
+                            (price - entry)
+                            / entry
+                            * 100
+                        )
+
+                        print(
+                            f"{symbol:6s} "
+                            f"status={trade['status']:14s} "
+                            f"price={price:.4f} "
+                            f"entry={entry:.4f} "
+                            f"P/L={pnl:+.2f}% "
+                            f"TP={tp:.4f} "
+                            f"SL={sl:.4f}"
+                        )
+
+                    else:
+
+                        print(
+                            f"{symbol:6s} "
+                            f"status={trade['status']}"
+                        )
+
+                print(
+                    "-" * 70
+                )
+
+        except Exception as e:
+
+            print(
+                f"[STATUS ERROR] {e}"
+            )
+
+        time.sleep(1)
 
 
 # ============================================================
@@ -1703,80 +1387,82 @@ def websocket_worker():
 
 def main():
 
-    print()
-    print("========================================")
-    print("LIVE TRADING ENGINE")
-    print("========================================")
-    print()
-
     print(
-        f"Symbols: {len(SYMBOLS)}"
+        "\n" + "=" * 70
     )
 
     print(
-        f"Trade size: ${TRADE_DOLLARS:.2f}"
+        "ALPACA MANUAL-EXIT LIVE TRADER"
     )
 
     print(
-        f"Expected threshold: "
-        f"{EXPECTED_THRESHOLD:.2%}"
+        "=" * 70
     )
 
     print(
-        f"Fixed take profit: "
-        f"{FIXED_TP_PERCENT:.2%}"
+        f"Paper Trading       : {ALPACA_PAPER}"
     )
 
     print(
-        f"Fixed stop loss: "
-        f"{FIXED_SL_PERCENT:.2%}"
+        f"Trade Dollars       : ${TRADE_DOLLARS:.2f}"
     )
 
     print(
-        f"Entry offset: "
-        f"${ENTRY_OFFSET:.2f}"
+        f"Fixed TP            : "
+        f"+{FIXED_TP_PERCENT * 100:.2f}%"
     )
 
     print(
-        f"Entry refresh: "
-        f"{ORDER_UPDATE_SECONDS}s"
+        f"Fixed SL            : "
+        f"-{FIXED_SL_PERCENT * 100:.2f}%"
     )
 
     print(
-        f"Exit monitoring: "
-        f"{EXIT_CHECK_SECONDS}s"
+        "Alpaca TP/SL Orders : DISABLED"
     )
 
     print(
-        "Long only"
+        "Entry Stop Orders   : DISABLED"
     )
 
     print(
-        "1 trade per stock per 1-minute bar"
+        "Entry Type          : MARKET"
     )
 
     print(
-        "Multiple trades across different bars allowed"
+        "Exit Type           : MARKET"
     )
 
-    print()
+    print(
+        "=" * 70
+    )
 
     # --------------------------------------------------------
-    # AUTHENTICATION
+    # AUTH
     # --------------------------------------------------------
 
     if not verify_alpaca_auth():
 
+        print(
+            "Authentication failed."
+        )
+
         return
 
     # --------------------------------------------------------
-    # HISTORICAL
+    # HISTORICAL DATA
     # --------------------------------------------------------
 
-    load_all_historical_stats()
+    load_historical_breakout_stats()
 
     # --------------------------------------------------------
-    # WEBSOCKET
+    # RECOVER EXISTING POSITIONS
+    # --------------------------------------------------------
+
+    reconcile_existing_positions()
+
+    # --------------------------------------------------------
+    # START WEBSOCKET
     # --------------------------------------------------------
 
     websocket_thread = threading.Thread(
@@ -1787,26 +1473,49 @@ def main():
     websocket_thread.start()
 
     # --------------------------------------------------------
-    # ENTRY ORDER UPDATER
+    # START ORDER MONITOR
     # --------------------------------------------------------
 
-    entry_thread = threading.Thread(
-        target=update_all_entry_orders,
+    order_thread = threading.Thread(
+        target=order_monitor_worker,
         daemon=True,
     )
 
-    entry_thread.start()
+    order_thread.start()
 
     # --------------------------------------------------------
-    # EXIT MONITOR
+    # START BACKUP PRICE MONITOR
     # --------------------------------------------------------
 
-    exit_thread = threading.Thread(
-        target=monitor_all_oco_orders,
+    safety_thread = threading.Thread(
+        target=position_safety_worker,
         daemon=True,
     )
 
-    exit_thread.start()
+    safety_thread.start()
+
+    # --------------------------------------------------------
+    # START STATUS
+    # --------------------------------------------------------
+
+    status_thread = threading.Thread(
+        target=status_worker,
+        daemon=True,
+    )
+
+    status_thread.start()
+
+    print(
+        "\nLIVE SYSTEM RUNNING."
+    )
+
+    print(
+        "Python is now responsible for entry, TP, and SL."
+    )
+
+    print(
+        "Keep this process running while positions are open."
+    )
 
     # --------------------------------------------------------
     # KEEP ALIVE
@@ -1818,9 +1527,8 @@ def main():
 
 
 # ============================================================
-# RUN
+# START
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
