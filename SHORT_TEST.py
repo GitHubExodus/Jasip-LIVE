@@ -1,21 +1,18 @@
 
+
+
+
+
+
+
 import time
 import math
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-import numpy as np
-
-from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
-
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-)
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import (
     OrderSide,
     TimeInForce,
@@ -26,12 +23,11 @@ from alpaca.trading.enums import (
 # CONFIG
 # ============================================================
 
-
 API_KEY = "PKA4A6THLEKI6QD2MQPOAO25J3"
 API_SECRET = "4nj9w53vMrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
 
-ALPACA_PAPER = True
 
+ALPACA_PAPER = True
 
 SYMBOLS = [
     "GIPR",
@@ -50,90 +46,34 @@ SYMBOLS = [
     "CYPH",
 ]
 
-
-# Dollar amount used for each entry.
 TRADE_DOLLARS = 100.00
 
-
-# ============================================================
+# ------------------------------------------------------------
 # ENTRY
-# ============================================================
+# ------------------------------------------------------------
 
-# Historical expected-profit filter.
-#
-# Set to 0.00 to allow every symbol with at least
-# one historical breakout.
-EXPECTED_THRESHOLD = 0.01
-
-
-# Entry trigger is:
-#
-# previous/current breakout high + ENTRY_OFFSET
-#
-# Example:
-#
-# breakout high = 5.18
-# offset = 0.01
-# trigger = 5.19
-#
-# Once a live tick crosses 5.19, we BUY at market.
 ENTRY_OFFSET = 0.01
 
-
-# ============================================================
+# ------------------------------------------------------------
 # EXIT
-# ============================================================
+# ------------------------------------------------------------
 
-# Take profit:
-#
-# +1.00%
-#
-# When Alpaca reports unrealized_plpc >= this value,
-# submit a market SELL.
-TP_PERCENT = 0.01
+TAKE_PROFIT_PERCENT = 0.01       # +1.00%
+STOP_LOSS_PERCENT = -0.005       # -0.50%
 
+# How often we ask Alpaca for positions/P&L.
+EXIT_CHECK_SECONDS = 1
 
-# Stop loss:
-#
-# -0.50%
-#
-# When Alpaca reports unrealized_plpc <= this value,
-# submit a market SELL.
-SL_PERCENT = -0.005
+# ------------------------------------------------------------
+# GENERAL
+# ------------------------------------------------------------
 
-
-# How frequently to ask Alpaca for current positions.
-POSITION_CHECK_SECONDS = 1.0
-
-
-# How long to wait after submitting an entry before
-# checking the order status again.
-ENTRY_ORDER_CHECK_SECONDS = 0.25
+PRINT_TICKS = False
 
 
 # ============================================================
-# HISTORICAL BREAKOUT
+# CLIENT
 # ============================================================
-
-BREAKOUT_FUTURE_BARS = 3
-
-HIST_START = datetime(
-    2026,
-    1,
-    1,
-    tzinfo=timezone.utc,
-)
-
-
-# ============================================================
-# CLIENTS
-# ============================================================
-
-historical_client = StockHistoricalDataClient(
-    API_KEY,
-    API_SECRET,
-)
-
 
 trading_client = TradingClient(
     API_KEY,
@@ -146,11 +86,10 @@ trading_client = TradingClient(
 # LIVE STATE
 # ============================================================
 
-CURRENT_1M_BAR = {
+CURRENT_BAR = {
     symbol: None
     for symbol in SYMBOLS
 }
-
 
 CURRENT_MINUTE = {
     symbol: None
@@ -158,278 +97,67 @@ CURRENT_MINUTE = {
 }
 
 
-# True once this symbol has entered during
-# the current 1-minute bar.
+# Current position state according to our program.
+IN_POSITION = {
+    symbol: False
+    for symbol in SYMBOLS
+}
+
+
+# Quantity bought.
+POSITION_QTY = {
+    symbol: 0
+    for symbol in SYMBOLS
+}
+
+
+# Entry price recorded after Alpaca confirms the buy.
+ENTRY_PRICE = {
+    symbol: None
+    for symbol in SYMBOLS
+}
+
+
+# Prevents multiple buy orders while one is being submitted.
+ENTRY_ORDER_PENDING = {
+    symbol: False
+    for symbol in SYMBOLS
+}
+
+
+# Prevents multiple sell orders.
+EXIT_ORDER_PENDING = {
+    symbol: False
+    for symbol in SYMBOLS
+}
+
+
+# Prevents another trade during the same 1-minute bar.
 TRADED_THIS_BAR = {
     symbol: False
     for symbol in SYMBOLS
 }
 
 
-# ============================================================
-# ENTRY STATE
-# ============================================================
-
-# Current market-entry order ID.
-#
-# Market orders can take a short amount of time to fill.
-ENTRY_ORDER_IDS = {
-    symbol: None
-    for symbol in SYMBOLS
-}
-
-
-# Prevents multiple entry submissions while an
-# entry order is still being processed.
-ENTRY_PENDING = {
-    symbol: False
-    for symbol in SYMBOLS
-}
-
-
-# ============================================================
-# POSITION STATE
-# ============================================================
-
-# True when we believe this program has an open trade.
-POSITION_OPEN = {
-    symbol: False
-    for symbol in SYMBOLS
-}
-
-
-# Prevents submitting multiple SELL orders while
-# an exit is already being processed.
-EXIT_PENDING = {
-    symbol: False
-    for symbol in SYMBOLS
-}
-
-
-# Last Alpaca-reported P&L percentage.
-LAST_PNL = {
-    symbol: None
-    for symbol in SYMBOLS
-}
-
-
-# ============================================================
-# HISTORICAL STATISTICS
-# ============================================================
-
-BREAKOUT_STATS = {
-    symbol: {
-        "sum": 0.0,
-        "count": 0,
-    }
-    for symbol in SYMBOLS
-}
-
-
-# ============================================================
-# ACCOUNT STATE
-# ============================================================
-
-REAL_TRADE_COUNT = 0
-
-
 STATE_LOCK = threading.Lock()
 
 
 # ============================================================
-# HISTORICAL BREAKOUT STATISTICS
+# PRICE ROUNDING
 # ============================================================
 
-def calculate_historical_breakout_stats(
-    symbol,
-    bars,
-):
-    """
-    Historical breakout:
+def round_price(price):
 
-        current bar high > previous bar high
+    price = float(price)
 
-    Reference:
+    if price >= 1.0:
+        return round(price, 2)
 
-        previous bar high
-
-    Future window:
-
-        breakout bar + next 3 bars
-
-    Expected profit:
-
-        (future_max_high - previous_high)
-        / previous_high
-    """
-
-    if bars is None:
-        return
-
-    if len(bars) < BREAKOUT_FUTURE_BARS + 2:
-        return
-
-    highs = np.asarray(
-        bars["high"],
-        dtype=np.float64,
-    )
-
-    total = 0.0
-    count = 0
-
-    future_window = (
-        BREAKOUT_FUTURE_BARS + 1
-    )
-
-    max_index = (
-        len(highs)
-        - future_window
-    )
-
-    for i in range(
-        1,
-        max_index + 1,
-    ):
-
-        previous_high = highs[i - 1]
-
-        breakout_high = highs[i]
-
-        if previous_high <= 0:
-            continue
-
-        if breakout_high <= previous_high:
-            continue
-
-        future_max_high = np.max(
-            highs[
-                i:i + future_window
-            ]
-        )
-
-        profit = (
-            future_max_high
-            - previous_high
-        ) / previous_high
-
-        total += profit
-        count += 1
-
-    BREAKOUT_STATS[symbol] = {
-        "sum": total,
-        "count": count,
-    }
-
-
-def get_expected_profit(symbol):
-
-    stats = BREAKOUT_STATS[symbol]
-
-    if stats["count"] == 0:
-        return None
-
-    return (
-        stats["sum"]
-        / stats["count"]
-    )
+    return round(price, 4)
 
 
 # ============================================================
-# HISTORICAL DATA
-# ============================================================
-
-def load_historical_stats(symbol):
-
-    end = (
-        datetime.now(timezone.utc)
-        - timedelta(minutes=10)
-    )
-
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Minute,
-        start=HIST_START,
-        end=end,
-        feed=DataFeed.IEX,
-    )
-
-    try:
-
-        response = (
-            historical_client
-            .get_stock_bars(request)
-        )
-
-        bars = response.df
-
-        if (
-            bars is None
-            or len(bars) == 0
-        ):
-
-            print(
-                f"[HIST] {symbol}: "
-                f"no historical data"
-            )
-
-            return
-
-        calculate_historical_breakout_stats(
-            symbol,
-            bars,
-        )
-
-        expected = get_expected_profit(
-            symbol
-        )
-
-        if expected is None:
-
-            print(
-                f"[HIST] {symbol}: "
-                f"no breakout samples"
-            )
-
-        else:
-
-            print(
-                f"[HIST] {symbol}: "
-                f"breakouts="
-                f"{BREAKOUT_STATS[symbol]['count']} "
-                f"expected="
-                f"{expected:.2%}"
-            )
-
-    except Exception as e:
-
-        print(
-            f"[HIST ERROR] "
-            f"{symbol}: {e}"
-        )
-
-
-def load_all_historical_stats():
-
-    print()
-    print("========================================")
-    print("LOADING HISTORICAL DATA")
-    print("========================================")
-
-    for symbol in SYMBOLS:
-
-        load_historical_stats(
-            symbol
-        )
-
-    print()
-    print(
-        "Historical calculation complete."
-    )
-    print()
-
-
-# ============================================================
-# LIVE 1-MINUTE BAR
+# MINUTE
 # ============================================================
 
 def get_minute_timestamp(timestamp):
@@ -439,6 +167,10 @@ def get_minute_timestamp(timestamp):
         microsecond=0,
     )
 
+
+# ============================================================
+# CREATE NEW BAR
+# ============================================================
 
 def create_new_bar(
     symbol,
@@ -451,7 +183,7 @@ def create_new_bar(
         timestamp
     )
 
-    CURRENT_1M_BAR[symbol] = {
+    CURRENT_BAR[symbol] = {
         "timestamp": minute,
         "open": price,
         "high": price,
@@ -462,8 +194,7 @@ def create_new_bar(
 
     CURRENT_MINUTE[symbol] = minute
 
-    # New minute means the symbol can
-    # potentially enter again.
+    # New minute = new trade opportunity.
     TRADED_THIS_BAR[symbol] = False
 
     print(
@@ -473,11 +204,15 @@ def create_new_bar(
     )
 
 
-def update_live_1m_bar(data):
+# ============================================================
+# UPDATE BAR
+# ============================================================
+
+def update_live_bar(data):
 
     symbol = data.symbol
 
-    if symbol not in CURRENT_1M_BAR:
+    if symbol not in CURRENT_BAR:
         return
 
     timestamp = data.timestamp
@@ -494,7 +229,7 @@ def update_live_1m_bar(data):
         timestamp
     )
 
-    current_bar = CURRENT_1M_BAR[symbol]
+    current_bar = CURRENT_BAR[symbol]
 
     # --------------------------------------------------------
     # NEW MINUTE
@@ -512,204 +247,189 @@ def update_live_1m_bar(data):
             size,
         )
 
-        return
-
     # --------------------------------------------------------
     # SAME MINUTE
     # --------------------------------------------------------
 
-    current_bar["high"] = max(
-        current_bar["high"],
+    else:
+
+        current_bar["high"] = max(
+            current_bar["high"],
+            price,
+        )
+
+        current_bar["low"] = min(
+            current_bar["low"],
+            price,
+        )
+
+        current_bar["close"] = price
+
+        current_bar["volume"] += size
+
+    # --------------------------------------------------------
+    # ENTRY CHECK HAPPENS ON EVERY TICK
+    # --------------------------------------------------------
+
+    check_entry_tick(
+        symbol,
         price,
     )
 
-    current_bar["low"] = min(
-        current_bar["low"],
-        price,
-    )
-
-    current_bar["close"] = price
-
-    current_bar["volume"] += size
-
 
 # ============================================================
-# CURRENT PRICE
-# ============================================================
-
-def get_current_market_price(symbol):
-
-    bar = CURRENT_1M_BAR[symbol]
-
-    if bar is None:
-        return None
-
-    return float(
-        bar["close"]
-    )
-
-
-# ============================================================
-# ENTRY TRIGGER
-# ============================================================
-
-def get_entry_trigger(symbol):
-
-    bar = CURRENT_1M_BAR[symbol]
-
-    if bar is None:
-        return None
-
-    current_high = float(
-        bar["high"]
-    )
-
-    return (
-        current_high
-        + ENTRY_OFFSET
-    )
-
-
-# ============================================================
-# CHECK ALPACA POSITION
+# GET CURRENT POSITION FROM ALPACA
 # ============================================================
 
 def get_alpaca_position(symbol):
 
     try:
 
-        position = (
-            trading_client
-            .get_open_position(symbol)
+        position = trading_client.get_open_position(
+            symbol
         )
 
         return position
 
     except Exception:
 
-        # A 404/no-position situation is normal
-        # when there is no open position.
+        return None
+
+
+# ============================================================
+# GET POSITION PNL %
+# ============================================================
+
+def get_position_pnl_percent(symbol):
+
+    position = get_alpaca_position(
+        symbol
+    )
+
+    if position is None:
+        return None
+
+    try:
+
+        pnl_percent = float(
+            position.unrealized_plpc
+        )
+
+        return pnl_percent
+
+    except Exception as e:
+
+        print(
+            f"[PNL ERROR] "
+            f"{symbol}: {e}"
+        )
 
         return None
 
 
 # ============================================================
-# CHECK ALL POSITIONS
+# SYNC POSITION
 # ============================================================
 
-def refresh_position_state():
+def sync_position(symbol):
+
+    position = get_alpaca_position(
+        symbol
+    )
+
+    # --------------------------------------------------------
+    # NO POSITION
+    # --------------------------------------------------------
+
+    if position is None:
+
+        if IN_POSITION[symbol]:
+
+            print(
+                f"[POSITION CLOSED] "
+                f"{symbol}"
+            )
+
+        IN_POSITION[symbol] = False
+        POSITION_QTY[symbol] = 0
+        ENTRY_PRICE[symbol] = None
+        EXIT_ORDER_PENDING[symbol] = False
+
+        return None
+
+    # --------------------------------------------------------
+    # POSITION EXISTS
+    # --------------------------------------------------------
 
     try:
 
-        positions = (
-            trading_client
-            .get_all_positions()
+        qty = float(
+            position.qty
         )
+
+        entry_price = float(
+            position.avg_entry_price
+        )
+
+        IN_POSITION[symbol] = True
+
+        POSITION_QTY[symbol] = qty
+
+        ENTRY_PRICE[symbol] = entry_price
+
+        return position
 
     except Exception as e:
 
         print(
-            f"[POSITION ERROR] {e}"
+            f"[POSITION SYNC ERROR] "
+            f"{symbol}: {e}"
         )
 
-        return
-
-    position_map = {
-        position.symbol: position
-        for position in positions
-    }
-
-    with STATE_LOCK:
-
-        for symbol in SYMBOLS:
-
-            position = position_map.get(
-                symbol
-            )
-
-            if position is None:
-
-                # No open position.
-                #
-                # Do NOT immediately clear EXIT_PENDING
-                # if a sell order was just submitted.
-                #
-                # The next cycle will naturally confirm
-                # the position is gone.
-
-                if not ENTRY_PENDING[symbol]:
-
-                    POSITION_OPEN[symbol] = False
-
-                LAST_PNL[symbol] = None
-
-                continue
-
-            # ------------------------------------------------
-            # Position exists
-            # ------------------------------------------------
-
-            POSITION_OPEN[symbol] = True
-
-            try:
-
-                pnl_percent = float(
-                    position.unrealized_plpc
-                )
-
-            except Exception:
-
-                pnl_percent = None
-
-            LAST_PNL[symbol] = (
-                pnl_percent
-            )
+        return None
 
 
 # ============================================================
-# SUBMIT MARKET ENTRY
+# BUY
 # ============================================================
 
-def submit_market_entry(
+def buy_symbol(
     symbol,
+    current_price,
 ):
 
-    # --------------------------------------------------------
-    # Do not enter if already holding.
-    # --------------------------------------------------------
-
-    if POSITION_OPEN[symbol]:
+    if IN_POSITION[symbol]:
         return
 
-    # --------------------------------------------------------
-    # Do not submit another entry while one
-    # is already pending.
-    # --------------------------------------------------------
-
-    if ENTRY_PENDING[symbol]:
+    if ENTRY_ORDER_PENDING[symbol]:
         return
 
-    price = get_current_market_price(
-        symbol
+    if TRADED_THIS_BAR[symbol]:
+        return
+
+    current_price = float(
+        current_price
     )
 
-    if price is None:
+    if current_price <= 0:
         return
 
     qty = math.floor(
-        TRADE_DOLLARS / price
+        TRADE_DOLLARS
+        / current_price
     )
 
     if qty < 1:
 
         print(
-            f"[ENTRY SKIP] {symbol}: "
-            f"price={price:.4f}"
+            f"[BUY SKIP] "
+            f"{symbol}: "
+            f"price={current_price:.4f}"
         )
 
         return
 
-    ENTRY_PENDING[symbol] = True
+    ENTRY_ORDER_PENDING[symbol] = True
 
     try:
 
@@ -720,244 +440,259 @@ def submit_market_entry(
             time_in_force=TimeInForce.DAY,
         )
 
-        order = (
-            trading_client
-            .submit_order(
-                order_data=request
-            )
+        order = trading_client.submit_order(
+            order_data=request
         )
 
         order_id = str(
             order.id
         )
 
-        ENTRY_ORDER_IDS[symbol] = (
-            order_id
-        )
-
         print(
-            f"[ENTRY] {symbol} "
-            f"BUY MARKET "
+            f"[BUY] "
+            f"{symbol} "
             f"qty={qty} "
-            f"market={price:.4f} "
+            f"market={current_price:.4f} "
             f"order={order_id}"
         )
 
-    except Exception as e:
+        # ----------------------------------------------------
+        # WAIT FOR ALPACA TO FILL
+        # ----------------------------------------------------
 
-        ENTRY_PENDING[symbol] = False
-        ENTRY_ORDER_IDS[symbol] = None
-
-        print(
-            f"[ENTRY ERROR] "
-            f"{symbol}: {e}"
-        )
-
-        return
-
-
-# ============================================================
-# VERIFY ENTRY
-# ============================================================
-
-def check_entry_fill(symbol):
-
-    if not ENTRY_PENDING[symbol]:
-        return
-
-    order_id = (
-        ENTRY_ORDER_IDS[symbol]
-    )
-
-    if order_id is None:
-        return
-
-    try:
-
-        order = (
-            trading_client
-            .get_order_by_id(
-                order_id
-            )
+        wait_for_buy_fill(
+            symbol,
+            order_id,
         )
 
     except Exception as e:
 
         print(
-            f"[ENTRY ORDER ERROR] "
+            f"[BUY ERROR] "
             f"{symbol}: {e}"
         )
 
-        return
-
-    status = str(
-        order.status
-    ).lower()
-
-    # --------------------------------------------------------
-    # FILLED
-    # --------------------------------------------------------
-
-    if status == "filled":
-
-        ENTRY_PENDING[symbol] = False
-        POSITION_OPEN[symbol] = True
-
-        filled_price = (
-            order.filled_avg_price
-        )
-
-        filled_qty = (
-            order.filled_qty
-        )
-
-        print(
-            f"[ENTRY FILLED] "
-            f"{symbol} "
-            f"qty={filled_qty} "
-            f"price={filled_price}"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # DEAD
-    # --------------------------------------------------------
-
-    if status in {
-        "canceled",
-        "cancelled",
-        "rejected",
-        "expired",
-    }:
-
-        ENTRY_PENDING[symbol] = False
-        ENTRY_ORDER_IDS[symbol] = None
-
-        print(
-            f"[ENTRY DEAD] "
-            f"{symbol} "
-            f"status={status}"
-        )
+        ENTRY_ORDER_PENDING[symbol] = False
 
 
 # ============================================================
-# ENTRY CROSSING LOGIC
+# WAIT FOR BUY FILL
 # ============================================================
 
-def check_entry_crossing(
+def wait_for_buy_fill(
     symbol,
+    order_id,
 ):
 
-    # --------------------------------------------------------
-    # Already traded this bar.
-    # --------------------------------------------------------
+    for _ in range(50):
+
+        try:
+
+            order = (
+                trading_client
+                .get_order_by_id(order_id)
+            )
+
+            status = str(
+                order.status
+            ).lower()
+
+            # ------------------------------------------------
+            # FILLED
+            # ------------------------------------------------
+
+            if status == "filled":
+
+                filled_price = float(
+                    order.filled_avg_price
+                )
+
+                filled_qty = float(
+                    order.filled_qty
+                )
+
+                with STATE_LOCK:
+
+                    IN_POSITION[symbol] = True
+
+                    POSITION_QTY[symbol] = (
+                        filled_qty
+                    )
+
+                    ENTRY_PRICE[symbol] = (
+                        filled_price
+                    )
+
+                    ENTRY_ORDER_PENDING[symbol] = (
+                        False
+                    )
+
+                    TRADED_THIS_BAR[symbol] = (
+                        True
+                    )
+
+                print(
+                    f"[BUY FILLED] "
+                    f"{symbol} "
+                    f"qty={filled_qty} "
+                    f"price={filled_price:.4f}"
+                )
+
+                return
+
+            # ------------------------------------------------
+            # DEAD
+            # ------------------------------------------------
+
+            if status in {
+                "canceled",
+                "cancelled",
+                "rejected",
+                "expired",
+            }:
+
+                print(
+                    f"[BUY DEAD] "
+                    f"{symbol} "
+                    f"status={status}"
+                )
+
+                ENTRY_ORDER_PENDING[symbol] = False
+
+                return
+
+        except Exception as e:
+
+            print(
+                f"[BUY CHECK ERROR] "
+                f"{symbol}: {e}"
+            )
+
+            ENTRY_ORDER_PENDING[symbol] = False
+
+            return
+
+        time.sleep(0.1)
+
+    print(
+        f"[BUY TIMEOUT] "
+        f"{symbol} "
+        f"order={order_id}"
+    )
+
+    ENTRY_ORDER_PENDING[symbol] = False
+
+
+# ============================================================
+# ENTRY CHECK — EVERY TICK
+# ============================================================
+
+def check_entry_tick(
+    symbol,
+    price,
+):
+
+    if IN_POSITION[symbol]:
+        return
+
+    if ENTRY_ORDER_PENDING[symbol]:
+        return
 
     if TRADED_THIS_BAR[symbol]:
         return
 
-    # --------------------------------------------------------
-    # Already have position.
-    # --------------------------------------------------------
+    bar = CURRENT_BAR[symbol]
 
-    if POSITION_OPEN[symbol]:
+    if bar is None:
         return
 
     # --------------------------------------------------------
-    # Entry order still being filled.
+    # Current 1-minute high.
+    #
+    # The current tick itself may already become the high.
+    # Therefore compare against the PREVIOUS high.
     # --------------------------------------------------------
 
-    if ENTRY_PENDING[symbol]:
-        return
-
-    # --------------------------------------------------------
-    # Historical filter.
-    # --------------------------------------------------------
-
-    expected_profit = (
-        get_expected_profit(symbol)
+    previous_high = float(
+        bar["high"]
     )
 
-    if (
-        expected_profit is None
-        or expected_profit <= EXPECTED_THRESHOLD
-    ):
-        return
-
-    # --------------------------------------------------------
-    # Get current trigger.
-    #
-    # NOTE:
-    #
-    # The trigger is based on the current 1-minute
-    # high + offset.
-    #
-    # Since we watch every tick, the entry happens
-    # when the live tick actually reaches/crosses it.
-    # --------------------------------------------------------
-
-    trigger = get_entry_trigger(
-        symbol
+    trigger = round_price(
+        previous_high
+        + ENTRY_OFFSET
     )
 
-    if trigger is None:
-        return
+    price = float(price)
 
-    current_price = (
-        get_current_market_price(
-            symbol
+    if PRINT_TICKS:
+
+        print(
+            f"[TICK] "
+            f"{symbol} "
+            f"price={price:.4f} "
+            f"trigger={trigger:.4f}"
         )
-    )
-
-    if current_price is None:
-        return
 
     # --------------------------------------------------------
     # CROSS ABOVE TRIGGER
     # --------------------------------------------------------
 
-    if current_price >= trigger:
+    if price >= trigger:
 
         print(
-            f"[BREAKOUT] {symbol} "
-            f"price={current_price:.4f} "
+            f"[BREAKOUT] "
+            f"{symbol} "
+            f"price={price:.4f} "
             f"trigger={trigger:.4f}"
         )
 
-        TRADED_THIS_BAR[symbol] = True
+        # Update high first.
+        bar["high"] = max(
+            bar["high"],
+            price,
+        )
 
-        submit_market_entry(
-            symbol
+        # Buy immediately at market.
+        buy_symbol(
+            symbol,
+            price,
         )
 
 
 # ============================================================
-# EXIT ONE POSITION
+# SELL
 # ============================================================
 
-def submit_market_exit(
+def sell_symbol(
     symbol,
-    position,
     reason,
     pnl_percent,
 ):
 
-    if EXIT_PENDING[symbol]:
+    if not IN_POSITION[symbol]:
         return
 
-    EXIT_PENDING[symbol] = True
+    if EXIT_ORDER_PENDING[symbol]:
+        return
+
+    qty = POSITION_QTY[symbol]
+
+    if qty <= 0:
+
+        print(
+            f"[SELL ERROR] "
+            f"{symbol}: invalid qty"
+        )
+
+        return
+
+    EXIT_ORDER_PENDING[symbol] = True
 
     try:
 
-        qty = float(
-            position.qty
-        )
-
-        if qty <= 0:
-
-            EXIT_PENDING[symbol] = False
-
-            return
+        # ----------------------------------------------------
+        # Normal market sell.
+        # ----------------------------------------------------
 
         request = MarketOrderRequest(
             symbol=symbol,
@@ -966,75 +701,77 @@ def submit_market_exit(
             time_in_force=TimeInForce.DAY,
         )
 
-        order = (
-            trading_client
-            .submit_order(
-                order_data=request
-            )
+        order = trading_client.submit_order(
+            order_data=request
         )
 
         print(
-            f"[EXIT] {symbol} "
-            f"SELL MARKET "
+            f"[SELL] "
+            f"{symbol} "
             f"qty={qty} "
             f"reason={reason} "
             f"pnl={pnl_percent:.2%} "
             f"order={order.id}"
         )
 
+        # Do NOT immediately mark the position closed.
+        # Wait until Alpaca confirms it is actually gone.
+
     except Exception as e:
 
-        EXIT_PENDING[symbol] = False
-
         print(
-            f"[EXIT ERROR] "
+            f"[SELL ERROR] "
             f"{symbol}: {e}"
         )
 
+        EXIT_ORDER_PENDING[symbol] = False
+
 
 # ============================================================
-# CHECK ONE POSITION PNL
+# CHECK ALL POSITIONS
 # ============================================================
 
-def check_position_exit(
+def check_position(
     symbol,
-    position,
 ):
+
+    position = sync_position(
+        symbol
+    )
 
     if position is None:
         return
 
-    if EXIT_PENDING[symbol]:
+    # --------------------------------------------------------
+    # If a sell order was already submitted, don't submit
+    # another one.
+    # --------------------------------------------------------
+
+    if EXIT_ORDER_PENDING[symbol]:
         return
 
-    try:
+    pnl_percent = get_position_pnl_percent(
+        symbol
+    )
 
-        pnl_percent = float(
-            position.unrealized_plpc
-        )
-
-    except Exception as e:
-
-        print(
-            f"[PNL ERROR] "
-            f"{symbol}: {e}"
-        )
-
+    if pnl_percent is None:
         return
 
-    LAST_PNL[symbol] = (
-        pnl_percent
+    print(
+        f"[PNL] "
+        f"{symbol} "
+        f"pnl={pnl_percent:.2%} "
+        f"entry={ENTRY_PRICE[symbol]:.4f}"
     )
 
     # --------------------------------------------------------
     # TAKE PROFIT
     # --------------------------------------------------------
 
-    if pnl_percent >= TP_PERCENT:
+    if pnl_percent >= TAKE_PROFIT_PERCENT:
 
-        submit_market_exit(
+        sell_symbol(
             symbol,
-            position,
             "TAKE_PROFIT",
             pnl_percent,
         )
@@ -1045,11 +782,10 @@ def check_position_exit(
     # STOP LOSS
     # --------------------------------------------------------
 
-    if pnl_percent <= SL_PERCENT:
+    if pnl_percent <= STOP_LOSS_PERCENT:
 
-        submit_market_exit(
+        sell_symbol(
             symbol,
-            position,
             "STOP_LOSS",
             pnl_percent,
         )
@@ -1065,174 +801,25 @@ def position_monitor():
 
     while True:
 
-        try:
-
-            # ------------------------------------------------
-            # First check whether pending entry orders
-            # filled.
-            # ------------------------------------------------
-
-            for symbol in SYMBOLS:
-
-                if ENTRY_PENDING[symbol]:
-
-                    try:
-
-                        check_entry_fill(
-                            symbol
-                        )
-
-                    except Exception as e:
-
-                        print(
-                            f"[ENTRY CHECK ERROR] "
-                            f"{symbol}: {e}"
-                        )
-
-            # ------------------------------------------------
-            # Get current positions from Alpaca.
-            # ------------------------------------------------
-
-            try:
-
-                positions = (
-                    trading_client
-                    .get_all_positions()
-                )
-
-            except Exception as e:
-
-                print(
-                    f"[POSITION GET ERROR] "
-                    f"{e}"
-                )
-
-                time.sleep(
-                    POSITION_CHECK_SECONDS
-                )
-
-                continue
-
-            position_map = {
-                position.symbol: position
-                for position in positions
-            }
-
-            # ------------------------------------------------
-            # Check every symbol.
-            # ------------------------------------------------
-
-            for symbol in SYMBOLS:
-
-                position = position_map.get(
-                    symbol
-                )
-
-                # ------------------------------------------------
-                # No position
-                # ------------------------------------------------
-
-                if position is None:
-
-                    if (
-                        EXIT_PENDING[symbol]
-                    ):
-
-                        # The position disappeared,
-                        # meaning the sell has completed.
-                        EXIT_PENDING[symbol] = False
-
-                        POSITION_OPEN[symbol] = False
-
-                        print(
-                            f"[EXIT CONFIRMED] "
-                            f"{symbol}"
-                        )
-
-                    elif not ENTRY_PENDING[symbol]:
-
-                        POSITION_OPEN[symbol] = False
-
-                    LAST_PNL[symbol] = None
-
-                    continue
-
-                # ------------------------------------------------
-                # Position exists
-                # ------------------------------------------------
-
-                POSITION_OPEN[symbol] = True
-
-                # ------------------------------------------------
-                # Check P&L against TP / SL.
-                # ------------------------------------------------
-
-                check_position_exit(
-                    symbol,
-                    position,
-                )
-
-            time.sleep(
-                POSITION_CHECK_SECONDS
-            )
-
-        except Exception as e:
-
-            print(
-                f"[POSITION MONITOR ERROR] "
-                f"{e}"
-            )
-
-            time.sleep(
-                POSITION_CHECK_SECONDS
-            )
-
-
-# ============================================================
-# ENTRY MONITOR
-# ============================================================
-
-def entry_monitor():
-
-    while True:
-
-        start = time.time()
-
         for symbol in SYMBOLS:
 
             try:
 
                 with STATE_LOCK:
 
-                    check_entry_crossing(
+                    check_position(
                         symbol
                     )
 
             except Exception as e:
 
                 print(
-                    f"[ENTRY MONITOR ERROR] "
+                    f"[POSITION ERROR] "
                     f"{symbol}: {e}"
                 )
 
-        elapsed = (
-            time.time()
-            - start
-        )
-
-        # This loop is intentionally very fast.
-        #
-        # The actual market-price updates come from
-        # the websocket.
-        #
-        # We only need to inspect the latest local
-        # price here.
-
         time.sleep(
-            max(
-                0.01,
-                0.05 - elapsed,
-            )
+            EXIT_CHECK_SECONDS
         )
 
 
@@ -1244,27 +831,19 @@ async def on_trade(data):
 
     symbol = data.symbol
 
-    if symbol not in CURRENT_1M_BAR:
+    if symbol not in CURRENT_BAR:
         return
 
     with STATE_LOCK:
 
-        update_live_1m_bar(
+        update_live_bar(
             data
         )
 
-        # ----------------------------------------------------
-        # ENTRY IS CHECKED DIRECTLY ON EVERY TICK.
-        #
-        # This is important.
-        #
-        # We don't wait for the 1-minute bar to close.
-        # ----------------------------------------------------
 
-        check_entry_crossing(
-            symbol
-        )
-
+# ============================================================
+# WEBSOCKET WORKER
+# ============================================================
 
 def websocket_worker():
 
@@ -1304,73 +883,59 @@ def websocket_worker():
 
 
 # ============================================================
-# PRINT POSITION STATUS
+# STARTUP POSITION SYNC
 # ============================================================
 
-def status_monitor():
+def startup_position_sync():
 
-    last_status_time = 0
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        "SYNCING EXISTING POSITIONS"
+    )
+    print(
+        "========================================"
+    )
 
-    while True:
+    for symbol in SYMBOLS:
 
-        now = time.time()
+        try:
 
-        if (
-            now - last_status_time
-            >= 5
-        ):
+            position = sync_position(
+                symbol
+            )
 
-            last_status_time = now
+            if position is not None:
 
-            try:
-
-                positions = (
-                    trading_client
-                    .get_all_positions()
+                pnl = get_position_pnl_percent(
+                    symbol
                 )
-
-                for position in positions:
-
-                    symbol = position.symbol
-
-                    try:
-
-                        pnl = float(
-                            position.unrealized_plpc
-                        )
-
-                    except Exception:
-
-                        pnl = None
-
-                    try:
-
-                        qty = float(
-                            position.qty
-                        )
-
-                    except Exception:
-
-                        qty = position.qty
-
-                    if pnl is not None:
-
-                        print(
-                            f"[POSITION] "
-                            f"{symbol} "
-                            f"qty={qty} "
-                            f"PNL={pnl:.2%} "
-                            f"TP={TP_PERCENT:.2%} "
-                            f"SL={SL_PERCENT:.2%}"
-                        )
-
-            except Exception as e:
 
                 print(
-                    f"[STATUS ERROR] {e}"
+                    f"[POSITION] "
+                    f"{symbol} "
+                    f"qty={POSITION_QTY[symbol]} "
+                    f"entry={ENTRY_PRICE[symbol]:.4f} "
+                    f"pnl="
+                    f"{pnl:.2%}"
+                    if pnl is not None
+                    else
+                    f"[POSITION] "
+                    f"{symbol} "
+                    f"qty={POSITION_QTY[symbol]} "
+                    f"entry={ENTRY_PRICE[symbol]:.4f}"
                 )
 
-        time.sleep(1)
+        except Exception as e:
+
+            print(
+                f"[STARTUP POSITION ERROR] "
+                f"{symbol}: {e}"
+            )
+
+    print()
 
 
 # ============================================================
@@ -1384,7 +949,7 @@ def main():
         "========================================"
     )
     print(
-        "LIVE TRADING ENGINE"
+        "SIMPLE LIVE TRADING ENGINE"
     )
     print(
         "========================================"
@@ -1400,63 +965,45 @@ def main():
     )
 
     print(
-        f"Expected threshold: "
-        f"{EXPECTED_THRESHOLD:.2%}"
-    )
-
-    print(
-        f"Entry offset: "
-        f"${ENTRY_OFFSET:.2f}"
+        f"Entry offset: ${ENTRY_OFFSET:.2f}"
     )
 
     print(
         f"Take profit: "
-        f"{TP_PERCENT:.2%}"
+        f"{TAKE_PROFIT_PERCENT:.2%}"
     )
 
     print(
         f"Stop loss: "
-        f"{SL_PERCENT:.2%}"
-    )
-
-    print(
-        f"Position check: "
-        f"{POSITION_CHECK_SECONDS}s"
+        f"{STOP_LOSS_PERCENT:.2%}"
     )
 
     print()
-
     print(
-        "ENTRY: market order after live tick crosses trigger"
+        "All stocks are eligible."
     )
-
     print(
-        "EXIT: market order based on Alpaca position P&L"
+        "Market BUY on breakout."
     )
-
     print(
-        "NO Alpaca stop orders"
+        "Market SELL on P&L threshold."
     )
-
     print(
-        "NO Alpaca take-profit orders"
+        "No Alpaca stop orders."
     )
-
     print(
-        "NO OCO orders"
+        "No Alpaca take-profit orders."
     )
-
     print(
-        "LONG ONLY"
+        "No OCO orders."
     )
-
     print()
 
     # --------------------------------------------------------
-    # HISTORICAL
+    # EXISTING POSITIONS
     # --------------------------------------------------------
 
-    load_all_historical_stats()
+    startup_position_sync()
 
     # --------------------------------------------------------
     # WEBSOCKET
@@ -1473,40 +1020,12 @@ def main():
     # POSITION MONITOR
     # --------------------------------------------------------
 
-    position_thread = threading.Thread(
+    monitor_thread = threading.Thread(
         target=position_monitor,
         daemon=True,
     )
 
-    position_thread.start()
-
-    # --------------------------------------------------------
-    # ENTRY MONITOR
-    #
-    # Mostly redundant because entry is also checked
-    # directly from every websocket tick.
-    #
-    # It acts as a safety net in case a websocket update
-    # was received but the immediate check was interrupted.
-    # --------------------------------------------------------
-
-    entry_thread = threading.Thread(
-        target=entry_monitor,
-        daemon=True,
-    )
-
-    entry_thread.start()
-
-    # --------------------------------------------------------
-    # STATUS MONITOR
-    # --------------------------------------------------------
-
-    status_thread = threading.Thread(
-        target=status_monitor,
-        daemon=True,
-    )
-
-    status_thread.start()
+    monitor_thread.start()
 
     # --------------------------------------------------------
     # KEEP ALIVE
