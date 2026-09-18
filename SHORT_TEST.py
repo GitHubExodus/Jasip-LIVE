@@ -1,11 +1,3 @@
-
-
-
-
-
-
-
-
 import os
 import time
 import math
@@ -26,11 +18,13 @@ from alpaca.trading.requests import (
     LimitOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
+    GetOrdersRequest,
 )
 from alpaca.trading.enums import (
     OrderSide,
     TimeInForce,
     OrderClass,
+    QueryOrderStatus,
 )
 
 
@@ -39,7 +33,7 @@ from alpaca.trading.enums import (
 # ============================================================
 
 API_KEY = "PKA4A6THLEKI6QD2MQPOAO25J3"
-API_SECRET = "4nj9w53vMrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
+API_SECRET = "4nj9w53MrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
 
 ALPACA_PAPER = True
 
@@ -69,7 +63,7 @@ SYMBOLS = [
 
 TRADE_DOLLARS = 100.00
 
-EXPECTED_THRESHOLD = 0.02
+EXPECTED_THRESHOLD = 0.00
 
 ORDER_UPDATE_SECONDS = 30
 
@@ -148,20 +142,13 @@ ENTRY_ORDER_IDS = {
 
 
 # Last entry trigger submitted for each stock.
-#
-# Prevents cancel/re-submit if the 1-minute high
-# has not actually changed.
 LAST_ENTRY_PRICE = {
     symbol: None
     for symbol in SYMBOLS
 }
 
 
-# OCO parent order for the most recent filled trade.
-#
-# A stock can have multiple historical trades.
-# Each new filled entry replaces this reference
-# with the newest OCO.
+# OCO parent orders for historical/current trades.
 OCO_ORDER_IDS = {
     symbol: []
     for symbol in SYMBOLS
@@ -399,10 +386,6 @@ def create_new_bar(
 
     CURRENT_MINUTE[symbol] = minute
 
-    # --------------------------------------------------------
-    # NEW BAR = RESET TRADE ABILITY
-    # --------------------------------------------------------
-
     TRADED_THIS_BAR[symbol] = False
 
     LAST_ENTRY_PRICE[symbol] = None
@@ -437,10 +420,6 @@ def update_live_1m_bar(data):
 
     current_bar = CURRENT_1M_BAR[symbol]
 
-    # --------------------------------------------------------
-    # NEW MINUTE
-    # --------------------------------------------------------
-
     if (
         current_bar is None
         or CURRENT_MINUTE[symbol] != minute
@@ -454,10 +433,6 @@ def update_live_1m_bar(data):
         )
 
         return
-
-    # --------------------------------------------------------
-    # SAME MINUTE
-    # --------------------------------------------------------
 
     current_bar["high"] = max(
         current_bar["high"],
@@ -489,13 +464,10 @@ def round_price(price):
 
 
 # ============================================================
-# GET ORDER
+# GET NORMAL ORDER
 # ============================================================
 
-def get_order(
-    order_id,
-    nested=False,
-):
+def get_order(order_id):
 
     if order_id is None:
         return None
@@ -503,8 +475,7 @@ def get_order(
     try:
 
         return trading_client.get_order_by_id(
-            order_id,
-            nested=nested,
+            order_id
         )
 
     except Exception as e:
@@ -518,20 +489,89 @@ def get_order(
 
 
 # ============================================================
+# GET NESTED ORDER
+# ============================================================
+
+def get_nested_order(
+    order_id,
+    symbol=None,
+):
+    """
+    Retrieves an order with nested multi-leg orders.
+
+    alpaca-py does not accept nested=True on
+    get_order_by_id() in the installed SDK.
+
+    Therefore we use get_orders() with nested=True
+    and locate the requested order.
+    """
+
+    if order_id is None:
+        return None
+
+    try:
+
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            limit=500,
+            nested=True,
+        )
+
+        if symbol is not None:
+
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                limit=500,
+                nested=True,
+                symbols=[symbol],
+            )
+
+        orders = trading_client.get_orders(
+            filter=request
+        )
+
+        wanted_id = str(
+            order_id
+        )
+
+        for order in orders:
+
+            if str(order.id) == wanted_id:
+                return order
+
+            legs = getattr(
+                order,
+                "legs",
+                None,
+            )
+
+            if not legs:
+                continue
+
+            for leg in legs:
+
+                if str(leg.id) == wanted_id:
+                    return order
+
+        return None
+
+    except Exception as e:
+
+        print(
+            f"[NESTED ORDER GET ERROR] "
+            f"{order_id}: {e}"
+        )
+
+        return None
+
+
+# ============================================================
 # ENTRY ORDER CANCELLATION
 # ============================================================
 
 def cancel_existing_entry(
     symbol,
 ):
-    """
-    Cancel the current pending BUY STOP.
-
-    IMPORTANT:
-    After requesting cancellation, we query the order
-    again because it may have filled immediately before
-    the cancellation reached Alpaca.
-    """
 
     order_id = ENTRY_ORDER_IDS[symbol]
 
@@ -545,6 +585,7 @@ def cancel_existing_entry(
     if order is None:
 
         ENTRY_ORDER_IDS[symbol] = None
+        LAST_ENTRY_PRICE[symbol] = None
 
         return False
 
@@ -552,7 +593,6 @@ def cancel_existing_entry(
         order.status
     ).lower()
 
-    # Already filled.
     if status == "filled":
 
         process_entry_fill(
@@ -562,7 +602,6 @@ def cancel_existing_entry(
 
         return True
 
-    # Already dead.
     if status in {
         "canceled",
         "cancelled",
@@ -571,6 +610,7 @@ def cancel_existing_entry(
     }:
 
         ENTRY_ORDER_IDS[symbol] = None
+        LAST_ENTRY_PRICE[symbol] = None
 
         return False
 
@@ -593,10 +633,6 @@ def cancel_existing_entry(
             f"{symbol}: {e}"
         )
 
-    # --------------------------------------------------------
-    # VERIFY FINAL STATE
-    # --------------------------------------------------------
-
     time.sleep(0.15)
 
     order_after = get_order(
@@ -606,6 +642,7 @@ def cancel_existing_entry(
     if order_after is None:
 
         ENTRY_ORDER_IDS[symbol] = None
+        LAST_ENTRY_PRICE[symbol] = None
 
         return False
 
@@ -630,10 +667,10 @@ def cancel_existing_entry(
     }:
 
         ENTRY_ORDER_IDS[symbol] = None
+        LAST_ENTRY_PRICE[symbol] = None
 
         return False
 
-    # Still pending.
     return False
 
 
@@ -645,11 +682,6 @@ def calculate_exit_prices(
     entry_price,
     expected_profit,
 ):
-
-    # Expected 10%
-    #
-    # TP = 5%
-    # SL = 2.5%
 
     tp_percent = (
         expected_profit
@@ -774,8 +806,6 @@ def submit_oco_after_fill(
             f"order={order_id}"
         )
 
-        # Immediately verify that Alpaca created
-        # the multi-leg order.
         verify_oco(
             symbol,
             order_id,
@@ -801,16 +831,10 @@ def verify_oco(
     symbol,
     order_id,
 ):
-    """
-    Retrieve the OCO with nested=True.
 
-    Alpaca exposes the TP/SL legs through the nested
-    multi-leg order response.
-    """
-
-    order = get_order(
+    order = get_nested_order(
         order_id,
-        nested=True,
+        symbol=symbol,
     )
 
     if order is None:
@@ -841,7 +865,7 @@ def verify_oco(
         print(
             f"[OCO VERIFY] "
             f"{symbol} "
-            f"no legs returned yet"
+            f"no legs returned"
         )
 
         return
@@ -868,9 +892,6 @@ def process_entry_fill(
     symbol,
     order,
 ):
-    """
-    Process a filled BUY STOP exactly once.
-    """
 
     global REAL_TRADE_COUNT
 
@@ -888,6 +909,13 @@ def process_entry_fill(
         order_id
     )
 
+    if order.filled_avg_price is None:
+        print(
+            f"[ENTRY FILL ERROR] "
+            f"{symbol}: no filled price"
+        )
+        return
+
     filled_price = float(
         order.filled_avg_price
     )
@@ -897,10 +925,6 @@ def process_entry_fill(
     )
 
     REAL_TRADE_COUNT += 1
-
-    # --------------------------------------------------------
-    # ONE TRADE FOR THIS 1-MINUTE BAR
-    # --------------------------------------------------------
 
     TRADED_THIS_BAR[symbol] = True
 
@@ -915,10 +939,6 @@ def process_entry_fill(
         f"price={filled_price:.4f} "
         f"trade_count={REAL_TRADE_COUNT}"
     )
-
-    # --------------------------------------------------------
-    # CREATE EXIT OCO
-    # --------------------------------------------------------
 
     submit_oco_after_fill(
         symbol,
@@ -974,6 +994,7 @@ def check_entry_order(
         )
 
         ENTRY_ORDER_IDS[symbol] = None
+        LAST_ENTRY_PRICE[symbol] = None
 
         return False
 
@@ -987,10 +1008,6 @@ def check_entry_order(
 def get_current_market_price(
     symbol,
 ):
-    """
-    Use the current live 1-minute bar close
-    as the latest live trade price.
-    """
 
     bar = CURRENT_1M_BAR[symbol]
 
@@ -1018,11 +1035,6 @@ def submit_entry_order(
     if entry_price <= 0:
         return
 
-    # --------------------------------------------------------
-    # Make sure the stop is still above the latest
-    # live price.
-    # --------------------------------------------------------
-
     current_price = (
         get_current_market_price(
             symbol
@@ -1043,10 +1055,6 @@ def submit_entry_order(
         )
 
         return
-
-    # --------------------------------------------------------
-    # Whole shares only.
-    # --------------------------------------------------------
 
     qty = math.floor(
         TRADE_DOLLARS
@@ -1096,6 +1104,13 @@ def submit_entry_order(
         )
 
     except Exception as e:
+
+        # Alpaca can reject the stop if the market
+        # moved through the trigger between our local
+        # validation and server-side order validation.
+
+        ENTRY_ORDER_IDS[symbol] = None
+        LAST_ENTRY_PRICE[symbol] = None
 
         print(
             f"[ENTRY ERROR] "
@@ -1163,7 +1178,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Check whether existing order filled.
+    # Check existing order.
     # --------------------------------------------------------
 
     if ENTRY_ORDER_IDS[symbol] is not None:
@@ -1176,7 +1191,7 @@ def update_entry_order(
             return
 
     # --------------------------------------------------------
-    # Current high + $0.01
+    # Calculate trigger from current 1-minute high.
     # --------------------------------------------------------
 
     current_high = float(
@@ -1188,6 +1203,10 @@ def update_entry_order(
         + ENTRY_OFFSET
     )
 
+    # --------------------------------------------------------
+    # Get newest locally known market price.
+    # --------------------------------------------------------
+
     current_price = (
         get_current_market_price(
             symbol
@@ -1198,8 +1217,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # If market already passed our trigger,
-    # do not submit an invalid BUY STOP.
+    # Trigger must still be above market.
     # --------------------------------------------------------
 
     if entry_price <= current_price:
@@ -1220,9 +1238,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Nothing changed.
-    #
-    # Keep the existing order instead of replacing it.
+    # Existing order already has this trigger.
     # --------------------------------------------------------
 
     if (
@@ -1250,14 +1266,14 @@ def update_entry_order(
             return
 
     # --------------------------------------------------------
-    # Re-check after cancellation.
+    # Check trade state again.
     # --------------------------------------------------------
 
     if TRADED_THIS_BAR[symbol]:
         return
 
     # --------------------------------------------------------
-    # Re-read latest market price.
+    # Final market-price check.
     # --------------------------------------------------------
 
     current_price = (
@@ -1281,7 +1297,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Submit replacement.
+    # Submit.
     # --------------------------------------------------------
 
     submit_entry_order(
@@ -1342,16 +1358,14 @@ def monitor_oco(
     """
     Monitor one OCO order and its legs.
 
-    This does NOT manually execute exits.
+    Alpaca executes the exits.
 
-    Alpaca still executes the TP/SL.
-
-    We only observe and report what happened.
+    This function only observes/report fills.
     """
 
-    order = get_order(
+    order = get_nested_order(
         oco_id,
-        nested=True,
+        symbol=symbol,
     )
 
     if order is None:
@@ -1472,8 +1486,6 @@ def monitor_oco(
 
 def monitor_all_oco_orders():
 
-    last_print = {}
-
     while True:
 
         for symbol in SYMBOLS:
@@ -1571,37 +1583,47 @@ def main():
     print("LIVE TRADING ENGINE")
     print("========================================")
     print()
+
     print(
         f"Symbols: {len(SYMBOLS)}"
     )
+
     print(
         f"Trade size: ${TRADE_DOLLARS:.2f}"
     )
+
     print(
         f"Expected threshold: "
         f"{EXPECTED_THRESHOLD:.2%}"
     )
+
     print(
         f"Entry offset: "
         f"${ENTRY_OFFSET:.2f}"
     )
+
     print(
         f"Entry refresh: "
         f"{ORDER_UPDATE_SECONDS}s"
     )
+
     print(
         f"Exit monitoring: "
         f"{EXIT_CHECK_SECONDS}s"
     )
+
     print(
         "Long only"
     )
+
     print(
         "1 trade per stock per 1-minute bar"
     )
+
     print(
         "Multiple trades across different bars allowed"
     )
+
     print()
 
     # --------------------------------------------------------
