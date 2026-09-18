@@ -35,7 +35,7 @@ from alpaca.trading.enums import (
 # ============================================================
 
 API_KEY = "PKA4A6THLEKI6QD2MQPOAO25J3"
-API_SECRET = "4nj9w53MrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
+API_SECRET = "4nj9w53vMrNKJGZsHqN7Siqy34z2Gis9TffWi2beszNU"
 
 ALPACA_PAPER = True
 
