@@ -44,6 +44,7 @@ SYMBOLS = [
     "MRNO",
     "TJGC",
     "CYPH",
+    "OLOX",
 ]
 
 TRADE_DOLLARS = 100.00
