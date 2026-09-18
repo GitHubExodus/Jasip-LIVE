@@ -1,4 +1,3 @@
-import os
 import time
 import math
 import threading
@@ -8,7 +7,10 @@ import numpy as np
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import (
+    StockBarsRequest,
+    StockLatestTradeRequest,
+)
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
@@ -115,16 +117,11 @@ CURRENT_MINUTE = {
     for symbol in SYMBOLS
 }
 
-
-# True means this stock already entered during
-# the current 1-minute bar.
 TRADED_THIS_BAR = {
     symbol: False
     for symbol in SYMBOLS
 }
 
-
-# Historical expected-profit statistics.
 BREAKOUT_STATS = {
     symbol: {
         "sum": 0.0,
@@ -133,40 +130,76 @@ BREAKOUT_STATS = {
     for symbol in SYMBOLS
 }
 
-
-# Current pending BUY STOP order.
 ENTRY_ORDER_IDS = {
     symbol: None
     for symbol in SYMBOLS
 }
 
-
-# Last entry trigger submitted for each stock.
 LAST_ENTRY_PRICE = {
     symbol: None
     for symbol in SYMBOLS
 }
 
-
-# OCO parent orders for historical/current trades.
 OCO_ORDER_IDS = {
     symbol: []
     for symbol in SYMBOLS
 }
 
-
-# Entry orders whose fills have already been processed.
 PROCESSED_ENTRY_FILLS = set()
 
-
-# OCO orders whose exit fill has already been reported.
 PROCESSED_EXIT_FILLS = set()
-
 
 REAL_TRADE_COUNT = 0
 
-
 STATE_LOCK = threading.Lock()
+
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+def verify_alpaca_auth():
+
+    print()
+    print("========================================")
+    print("CHECKING ALPACA AUTHENTICATION")
+    print("========================================")
+
+    try:
+
+        account = trading_client.get_account()
+
+        print(
+            f"[AUTH OK] "
+            f"account={account.id}"
+        )
+
+        print(
+            f"[AUTH OK] "
+            f"paper={ALPACA_PAPER}"
+        )
+
+        print()
+
+        return True
+
+    except Exception as e:
+
+        print()
+        print(
+            f"[AUTH ERROR] {e}"
+        )
+        print()
+        print(
+            "Trading engine will not start."
+        )
+        print(
+            "Check that the replacement script inserted "
+            "the correct Alpaca PAPER API key and secret."
+        )
+        print()
+
+        return False
 
 
 # ============================================================
@@ -177,24 +210,6 @@ def calculate_historical_breakout_stats(
     symbol,
     bars,
 ):
-    """
-    Historical breakout:
-
-        current bar high > previous bar high
-
-    Reference price:
-
-        previous bar high
-
-    Future window:
-
-        breakout bar + next 3 bars
-
-    Expected profit:
-
-        (future_max_high - previous_high)
-        / previous_high
-    """
 
     if bars is None:
         return
@@ -210,9 +225,14 @@ def calculate_historical_breakout_stats(
     total = 0.0
     count = 0
 
-    future_window = BREAKOUT_FUTURE_BARS + 1
+    future_window = (
+        BREAKOUT_FUTURE_BARS + 1
+    )
 
-    max_index = len(highs) - future_window
+    max_index = (
+        len(highs)
+        - future_window
+    )
 
     for i in range(
         1,
@@ -464,7 +484,7 @@ def round_price(price):
 
 
 # ============================================================
-# GET NORMAL ORDER
+# NORMAL ORDER GET
 # ============================================================
 
 def get_order(order_id):
@@ -473,6 +493,13 @@ def get_order(order_id):
         return None
 
     try:
+
+        # IMPORTANT:
+        # Do NOT pass nested=True here.
+        #
+        # The installed alpaca-py version's
+        # get_order_by_id() does not accept that
+        # keyword argument.
 
         return trading_client.get_order_by_id(
             order_id
@@ -489,42 +516,34 @@ def get_order(order_id):
 
 
 # ============================================================
-# GET NESTED ORDER
+# NESTED ORDER GET
 # ============================================================
 
 def get_nested_order(
     order_id,
     symbol=None,
 ):
-    """
-    Retrieves an order with nested multi-leg orders.
-
-    alpaca-py does not accept nested=True on
-    get_order_by_id() in the installed SDK.
-
-    Therefore we use get_orders() with nested=True
-    and locate the requested order.
-    """
 
     if order_id is None:
         return None
 
     try:
 
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            limit=500,
-            nested=True,
-        )
+        request_kwargs = {
+            "status": QueryOrderStatus.ALL,
+            "limit": 500,
+            "nested": True,
+        }
 
         if symbol is not None:
 
-            request = GetOrdersRequest(
-                status=QueryOrderStatus.ALL,
-                limit=500,
-                nested=True,
-                symbols=[symbol],
-            )
+            request_kwargs["symbols"] = [
+                symbol
+            ]
+
+        request = GetOrdersRequest(
+            **request_kwargs
+        )
 
         orders = trading_client.get_orders(
             filter=request
@@ -560,6 +579,54 @@ def get_nested_order(
         print(
             f"[NESTED ORDER GET ERROR] "
             f"{order_id}: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# LATEST SERVER-SIDE PRICE
+# ============================================================
+
+def get_latest_server_price(
+    symbol,
+):
+
+    try:
+
+        request = StockLatestTradeRequest(
+            symbol_or_symbols=symbol,
+            feed=DataFeed.IEX,
+        )
+
+        trades = (
+            historical_client
+            .get_stock_latest_trade(
+                request_params=request
+            )
+        )
+
+        trade = trades.get(
+            symbol
+        )
+
+        if trade is None:
+            return None
+
+        price = float(
+            trade.price
+        )
+
+        if price <= 0:
+            return None
+
+        return price
+
+    except Exception as e:
+
+        print(
+            f"[LATEST PRICE ERROR] "
+            f"{symbol}: {e}"
         )
 
         return None
@@ -910,10 +977,12 @@ def process_entry_fill(
     )
 
     if order.filled_avg_price is None:
+
         print(
             f"[ENTRY FILL ERROR] "
             f"{symbol}: no filled price"
         )
+
         return
 
     filled_price = float(
@@ -1002,7 +1071,7 @@ def check_entry_order(
 
 
 # ============================================================
-# CURRENT MARKET PRICE
+# LOCAL CURRENT MARKET PRICE
 # ============================================================
 
 def get_current_market_price(
@@ -1035,23 +1104,80 @@ def submit_entry_order(
     if entry_price <= 0:
         return
 
-    current_price = (
+    # --------------------------------------------------------
+    # First check: local websocket price.
+    # --------------------------------------------------------
+
+    local_price = (
         get_current_market_price(
             symbol
         )
     )
 
-    if current_price is None:
+    if local_price is None:
+
+        print(
+            f"[ENTRY SKIP] "
+            f"{symbol}: "
+            f"no local market price"
+        )
+
         return
 
-    if entry_price <= current_price:
+    if entry_price <= local_price:
 
         print(
             f"[ENTRY SKIP] "
             f"{symbol} "
             f"trigger={entry_price:.4f} "
-            f"market={current_price:.4f} "
+            f"local={local_price:.4f} "
             f"trigger_not_above_market"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CRITICAL FIX:
+    #
+    # Get Alpaca's latest server-side trade immediately
+    # before submitting the stop order.
+    #
+    # The local websocket price can be stale by the time
+    # Alpaca receives the order.
+    # --------------------------------------------------------
+
+    server_price = (
+        get_latest_server_price(
+            symbol
+        )
+    )
+
+    if server_price is None:
+
+        print(
+            f"[ENTRY SKIP] "
+            f"{symbol}: "
+            f"could not get latest server price"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Server-side validation.
+    #
+    # For a BUY STOP:
+    #
+    # stop_price must be above the current market.
+    # --------------------------------------------------------
+
+    if entry_price <= server_price:
+
+        print(
+            f"[ENTRY SKIP] "
+            f"{symbol} "
+            f"trigger={entry_price:.4f} "
+            f"server={server_price:.4f} "
+            f"market_already_above_trigger"
         )
 
         return
@@ -1070,6 +1196,10 @@ def submit_entry_order(
         )
 
         return
+
+    # --------------------------------------------------------
+    # Submit.
+    # --------------------------------------------------------
 
     try:
 
@@ -1099,23 +1229,40 @@ def submit_entry_order(
             f"BUY STOP "
             f"qty={qty} "
             f"trigger={entry_price:.4f} "
-            f"market={current_price:.4f} "
+            f"local={local_price:.4f} "
+            f"server={server_price:.4f} "
             f"order={order.id}"
         )
 
     except Exception as e:
 
-        # Alpaca can reject the stop if the market
-        # moved through the trigger between our local
-        # validation and server-side order validation.
-
         ENTRY_ORDER_IDS[symbol] = None
         LAST_ENTRY_PRICE[symbol] = None
 
+        error_text = str(e)
+
         print(
             f"[ENTRY ERROR] "
-            f"{symbol}: {e}"
+            f"{symbol}: {error_text}"
         )
+
+        # ----------------------------------------------------
+        # This can still happen if the market moves between
+        # the latest-trade request and Alpaca receiving the
+        # order.
+        # ----------------------------------------------------
+
+        if (
+            "stop price must be greater"
+            in error_text.lower()
+        ):
+
+            print(
+                f"[ENTRY RACE] "
+                f"{symbol}: "
+                f"market moved through trigger "
+                f"before Alpaca accepted the order."
+            )
 
 
 # ============================================================
@@ -1191,7 +1338,7 @@ def update_entry_order(
             return
 
     # --------------------------------------------------------
-    # Calculate trigger from current 1-minute high.
+    # Calculate trigger.
     # --------------------------------------------------------
 
     current_high = float(
@@ -1204,7 +1351,7 @@ def update_entry_order(
     )
 
     # --------------------------------------------------------
-    # Get newest locally known market price.
+    # Local market price.
     # --------------------------------------------------------
 
     current_price = (
@@ -1217,7 +1364,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Trigger must still be above market.
+    # Trigger must be above local market.
     # --------------------------------------------------------
 
     if entry_price <= current_price:
@@ -1273,7 +1420,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Final market-price check.
+    # Final local check.
     # --------------------------------------------------------
 
     current_price = (
@@ -1298,6 +1445,9 @@ def update_entry_order(
 
     # --------------------------------------------------------
     # Submit.
+    #
+    # submit_entry_order() performs the additional
+    # server-side latest-price check.
     # --------------------------------------------------------
 
     submit_entry_order(
@@ -1355,13 +1505,6 @@ def monitor_oco(
     symbol,
     oco_id,
 ):
-    """
-    Monitor one OCO order and its legs.
-
-    Alpaca executes the exits.
-
-    This function only observes/report fills.
-    """
 
     order = get_nested_order(
         oco_id,
@@ -1537,39 +1680,75 @@ async def on_trade(data):
 
 def websocket_worker():
 
-    while True:
+    try:
 
-        try:
+        stream = StockDataStream(
+            API_KEY,
+            API_SECRET,
+            feed=DataFeed.IEX,
+        )
 
-            stream = StockDataStream(
-                API_KEY,
-                API_SECRET,
+        for symbol in SYMBOLS:
+
+            stream.subscribe_trades(
+                on_trade,
+                symbol,
             )
 
-            for symbol in SYMBOLS:
+        print(
+            "[WS] Starting live stream..."
+        )
 
-                stream.subscribe_trades(
-                    on_trade,
-                    symbol,
-                )
+        stream.run()
+
+    except Exception as e:
+
+        error_text = str(e)
+
+        print(
+            f"[WS ERROR] {error_text}"
+        )
+
+        # ----------------------------------------------------
+        # Do NOT endlessly reconnect when authentication
+        # itself has failed.
+        # ----------------------------------------------------
+
+        if (
+            "auth failed"
+            in error_text.lower()
+            or "authentication"
+            in error_text.lower()
+            or "unauthorized"
+            in error_text.lower()
+        ):
 
             print(
-                "[WS] Starting live stream..."
-            )
-
-            stream.run()
-
-        except Exception as e:
-
-            print(
-                f"[WS ERROR] {e}"
+                "[WS] Authentication failed."
             )
 
             print(
-                "[WS] Reconnecting in 5 seconds..."
+                "[WS] WebSocket stopped. "
+                "Check the Alpaca paper API credentials."
             )
 
-            time.sleep(5)
+            return
+
+        # ----------------------------------------------------
+        # Non-auth WebSocket failure.
+        # ----------------------------------------------------
+
+        print(
+            "[WS] Non-authentication failure."
+        )
+
+        print(
+            "[WS] Reconnecting in 5 seconds..."
+        )
+
+        time.sleep(5)
+
+        websocket_worker()
 
 
 # ============================================================
@@ -1625,6 +1804,14 @@ def main():
     )
 
     print()
+
+    # --------------------------------------------------------
+    # AUTHENTICATION
+    # --------------------------------------------------------
+
+    if not verify_alpaca_auth():
+
+        return
 
     # --------------------------------------------------------
     # HISTORICAL
