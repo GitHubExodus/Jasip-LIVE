@@ -54,18 +54,22 @@ SYMBOLS = [
     "MRNO",
     "TJGC",
     "CYPH",
-    "HPE",
-    "AMD",
-    "AAPL",
-    "NVDA",
-    "DELL",
-    "INTC",
-    "CRWD",
 ]
 
 TRADE_DOLLARS = 100.00
 
-EXPECTED_THRESHOLD = 0.00
+# Historical expected-profit filter.
+EXPECTED_THRESHOLD = 0.01
+
+# ------------------------------------------------------------
+# FIXED EXIT SETTINGS
+# ------------------------------------------------------------
+
+FIXED_TP_PERCENT = 0.01
+
+FIXED_SL_PERCENT = 0.005
+
+# ------------------------------------------------------------
 
 ORDER_UPDATE_SECONDS = 30
 
@@ -74,10 +78,6 @@ EXIT_CHECK_SECONDS = 2
 ENTRY_OFFSET = 0.01
 
 BREAKOUT_FUTURE_BARS = 3
-
-TP_FRACTION = 0.50
-
-SL_FRACTION_OF_TP = 0.50
 
 HIST_START = datetime(
     2026,
@@ -194,8 +194,7 @@ def verify_alpaca_auth():
             "Trading engine will not start."
         )
         print(
-            "Check that the replacement script inserted "
-            "the correct Alpaca PAPER API key and secret."
+            "Check the Alpaca paper API credentials."
         )
         print()
 
@@ -484,7 +483,7 @@ def round_price(price):
 
 
 # ============================================================
-# NORMAL ORDER GET
+# GET NORMAL ORDER
 # ============================================================
 
 def get_order(order_id):
@@ -493,13 +492,6 @@ def get_order(order_id):
         return None
 
     try:
-
-        # IMPORTANT:
-        # Do NOT pass nested=True here.
-        #
-        # The installed alpaca-py version's
-        # get_order_by_id() does not accept that
-        # keyword argument.
 
         return trading_client.get_order_by_id(
             order_id
@@ -516,7 +508,7 @@ def get_order(order_id):
 
 
 # ============================================================
-# NESTED ORDER GET
+# GET NESTED ORDER
 # ============================================================
 
 def get_nested_order(
@@ -585,7 +577,7 @@ def get_nested_order(
 
 
 # ============================================================
-# LATEST SERVER-SIDE PRICE
+# GET LATEST SERVER-SIDE PRICE
 # ============================================================
 
 def get_latest_server_price(
@@ -742,32 +734,28 @@ def cancel_existing_entry(
 
 
 # ============================================================
-# EXIT PRICE CALCULATION
+# FIXED EXIT PRICE CALCULATION
 # ============================================================
 
 def calculate_exit_prices(
     entry_price,
-    expected_profit,
 ):
 
-    tp_percent = (
-        expected_profit
-        * TP_FRACTION
-    )
-
-    sl_percent = (
-        tp_percent
-        * SL_FRACTION_OF_TP
-    )
+    # --------------------------------------------------------
+    # FIXED:
+    #
+    # TP = +1.00%
+    # SL = -0.50%
+    # --------------------------------------------------------
 
     take_profit = (
         entry_price
-        * (1.0 + tp_percent)
+        * (1.0 + FIXED_TP_PERCENT)
     )
 
     stop_loss = (
         entry_price
-        * (1.0 - sl_percent)
+        * (1.0 - FIXED_SL_PERCENT)
     )
 
     take_profit = round_price(
@@ -800,23 +788,9 @@ def submit_oco_after_fill(
     entry_price,
 ):
 
-    expected_profit = get_expected_profit(
-        symbol
-    )
-
-    if expected_profit is None:
-
-        print(
-            f"[OCO ERROR] {symbol}: "
-            f"no historical expected profit"
-        )
-
-        return None
-
     take_profit, stop_loss = (
         calculate_exit_prices(
-            entry_price,
-            expected_profit,
+            entry_price
         )
     )
 
@@ -832,9 +806,10 @@ def submit_oco_after_fill(
     print(
         f"[OCO SUBMIT] {symbol} "
         f"entry={entry_price:.4f} "
-        f"expected={expected_profit:.2%} "
         f"TP={take_profit:.4f} "
         f"SL={stop_loss:.4f} "
+        f"TP%={FIXED_TP_PERCENT:.2%} "
+        f"SL%={FIXED_SL_PERCENT:.2%} "
         f"qty={qty}"
     )
 
@@ -1071,7 +1046,7 @@ def check_entry_order(
 
 
 # ============================================================
-# LOCAL CURRENT MARKET PRICE
+# CURRENT MARKET PRICE
 # ============================================================
 
 def get_current_market_price(
@@ -1105,7 +1080,7 @@ def submit_entry_order(
         return
 
     # --------------------------------------------------------
-    # First check: local websocket price.
+    # LOCAL PRICE CHECK
     # --------------------------------------------------------
 
     local_price = (
@@ -1137,13 +1112,7 @@ def submit_entry_order(
         return
 
     # --------------------------------------------------------
-    # CRITICAL FIX:
-    #
-    # Get Alpaca's latest server-side trade immediately
-    # before submitting the stop order.
-    #
-    # The local websocket price can be stale by the time
-    # Alpaca receives the order.
+    # SERVER PRICE CHECK
     # --------------------------------------------------------
 
     server_price = (
@@ -1162,14 +1131,6 @@ def submit_entry_order(
 
         return
 
-    # --------------------------------------------------------
-    # Server-side validation.
-    #
-    # For a BUY STOP:
-    #
-    # stop_price must be above the current market.
-    # --------------------------------------------------------
-
     if entry_price <= server_price:
 
         print(
@@ -1181,6 +1142,10 @@ def submit_entry_order(
         )
 
         return
+
+    # --------------------------------------------------------
+    # POSITION SIZE
+    # --------------------------------------------------------
 
     qty = math.floor(
         TRADE_DOLLARS
@@ -1198,7 +1163,7 @@ def submit_entry_order(
         return
 
     # --------------------------------------------------------
-    # Submit.
+    # SUBMIT BUY STOP
     # --------------------------------------------------------
 
     try:
@@ -1246,12 +1211,6 @@ def submit_entry_order(
             f"{symbol}: {error_text}"
         )
 
-        # ----------------------------------------------------
-        # This can still happen if the market moves between
-        # the latest-trade request and Alpaca receiving the
-        # order.
-        # ----------------------------------------------------
-
         if (
             "stop price must be greater"
             in error_text.lower()
@@ -1279,7 +1238,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Already traded this bar.
+    # ALREADY TRADED THIS BAR
     # --------------------------------------------------------
 
     if TRADED_THIS_BAR[symbol]:
@@ -1302,7 +1261,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Historical expected-profit filter.
+    # EXPECTED-PROFIT ENTRY FILTER
     # --------------------------------------------------------
 
     expected_profit = (
@@ -1325,7 +1284,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Check existing order.
+    # CHECK EXISTING ORDER
     # --------------------------------------------------------
 
     if ENTRY_ORDER_IDS[symbol] is not None:
@@ -1338,7 +1297,7 @@ def update_entry_order(
             return
 
     # --------------------------------------------------------
-    # Calculate trigger.
+    # CALCULATE ENTRY TRIGGER
     # --------------------------------------------------------
 
     current_high = float(
@@ -1351,7 +1310,7 @@ def update_entry_order(
     )
 
     # --------------------------------------------------------
-    # Local market price.
+    # LOCAL MARKET PRICE
     # --------------------------------------------------------
 
     current_price = (
@@ -1364,7 +1323,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Trigger must be above local market.
+    # TRIGGER MUST BE ABOVE MARKET
     # --------------------------------------------------------
 
     if entry_price <= current_price:
@@ -1385,7 +1344,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Existing order already has this trigger.
+    # EXISTING ORDER HAS SAME TRIGGER
     # --------------------------------------------------------
 
     if (
@@ -1398,7 +1357,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Replace old order.
+    # CANCEL OLD ORDER
     # --------------------------------------------------------
 
     if ENTRY_ORDER_IDS[symbol] is not None:
@@ -1413,14 +1372,14 @@ def update_entry_order(
             return
 
     # --------------------------------------------------------
-    # Check trade state again.
+    # CHECK TRADE STATE AGAIN
     # --------------------------------------------------------
 
     if TRADED_THIS_BAR[symbol]:
         return
 
     # --------------------------------------------------------
-    # Final local check.
+    # FINAL LOCAL CHECK
     # --------------------------------------------------------
 
     current_price = (
@@ -1444,10 +1403,7 @@ def update_entry_order(
         return
 
     # --------------------------------------------------------
-    # Submit.
-    #
-    # submit_entry_order() performs the additional
-    # server-side latest-price check.
+    # SUBMIT
     # --------------------------------------------------------
 
     submit_entry_order(
@@ -1709,11 +1665,6 @@ def websocket_worker():
             f"[WS ERROR] {error_text}"
         )
 
-        # ----------------------------------------------------
-        # Do NOT endlessly reconnect when authentication
-        # itself has failed.
-        # ----------------------------------------------------
-
         if (
             "auth failed"
             in error_text.lower()
@@ -1728,15 +1679,10 @@ def websocket_worker():
             )
 
             print(
-                "[WS] WebSocket stopped. "
-                "Check the Alpaca paper API credentials."
+                "[WS] WebSocket stopped."
             )
 
             return
-
-        # ----------------------------------------------------
-        # Non-auth WebSocket failure.
-        # ----------------------------------------------------
 
         print(
             "[WS] Non-authentication failure."
@@ -1774,6 +1720,16 @@ def main():
     print(
         f"Expected threshold: "
         f"{EXPECTED_THRESHOLD:.2%}"
+    )
+
+    print(
+        f"Fixed take profit: "
+        f"{FIXED_TP_PERCENT:.2%}"
+    )
+
+    print(
+        f"Fixed stop loss: "
+        f"{FIXED_SL_PERCENT:.2%}"
     )
 
     print(
