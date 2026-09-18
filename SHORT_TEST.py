@@ -60,7 +60,7 @@ ENTRY_OFFSET = 0.0000001
 # ------------------------------------------------------------
 
 TAKE_PROFIT_PERCENT = 0.01       # +1.00%
-STOP_LOSS_PERCENT = -0.005       # -0.50%
+STOP_LOSS_PERCENT = -0.0005       # -0.50%
 
 # How often we ask Alpaca for positions/P&L.
 EXIT_CHECK_SECONDS = 1
